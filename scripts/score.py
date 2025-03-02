@@ -1,5 +1,3 @@
-## original inference file from official PoET
-
 import argparse
 import itertools
 import string
@@ -208,7 +206,7 @@ def parse_args():
         type=str,
         default="data/BLAT_ECOLX_Jacquier_2013_variants.npy",
     )
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=188257)
     parser.add_argument(
         "--debug",
@@ -229,16 +227,20 @@ def main():
 
     # load model
     ckpt = torch.load(args.ckpt_path)
+    print(ckpt["hyper_parameters"]["model_spec"]["init_args"])
+    print(ckpt["state_dict"].keys())
     model = PoET(**ckpt["hyper_parameters"]["model_spec"]["init_args"])
     model.load_state_dict(
         {k.split(".", 1)[1]: v for k, v in ckpt["state_dict"].items()}
     )
     del ckpt
     model = model.cuda().half().eval()
+
     alphabet = Uniprot21(
         include_gap=True, include_startstop=True, distinct_startstop=True
     )
     jit_warmup(model, alphabet)
+    breakpoint()
 
     # get variants to score
     variants = [

@@ -1440,6 +1440,7 @@ class PoET(nn.Module, LogitsAllocateMemoryMixin):
         xs, indices, _, _ = unpad_input(xs.unsqueeze(2), ~get_mask(seqs_seqlens))
         xs = xs.squeeze(1)
         h = self.token_embed.forward(xs)
+
         segment_sizes_cpu = segment_sizes.cpu()
         seqs_seqlens_cpu = segment_sizes_cpu.sum(dim=1).type(torch.int32)
         nonzero_segment_sizes_cpu = (
