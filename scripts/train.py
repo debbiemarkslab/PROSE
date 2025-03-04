@@ -1,5 +1,5 @@
 import argparse
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pytorch_lightning as lightning
@@ -10,7 +10,9 @@ from torch_optimizer import Adafactor
 
 from poet.alphabets import Alphabet, Uniprot21
 from poet.models.poet import PoET
-
+import random 
+from pytorch_lightning.loggers.wandb import WandbLogger
+from pytorch_lightning.utilities.grads import grad_norm
 IGNORE_INDEX = -100
 
 
@@ -50,35 +52,35 @@ class ATCG(Alphabet):
 class PromoterDataset(Dataset):
     """Still need to figure out how each family is organized"""
 
-    def __init__(self, sequences: dict, alphabet, max_length):
+    def __init__(self, sequences: dict, queries: dict, alphabet, max_length):
         self.alphabet = alphabet
         self.sequences = sequences
-        self.num_special_characters = 4
+        self.queries = queries
+        self.num_special_characters = 2
         self.ids = list(sequences.keys())
         self.max_len = max_length
 
     def __getitem__(self, idx):
-        id = self.ids[idx]
-        return self.pack_inputs(id)
+        # randomly sample a gene with replacement, perhaps add weights here  
+        id = random.choice(self.ids)
+        sampled_set = self.sample_and_fit_sequences(id, weights = None, max_individual_seq_length=None, max_seq_length=1024)
+        return self.pack_inputs(sampled_set, self.alphabet, self.max_len)
 
     def sample_and_fit_sequences(
         self,
-        query_id_or_sequence: Optional[
-            str
-        ] = None,  # Changed parameter name to be more explicit
-        member_ids: Optional[List[str]] = None,
+        query_id_or_sequence: Optional[str] = None,  # Changed parameter name to be more explicit
         weights: Optional[List[float]] = None,
-        fasta_dataset: Optional[Dict[str, str]] = None,
         max_seq_length: int = 1024,
+        max_individual_seq_length: Optional[int] = None,
         include_query: bool = True,
         sample: bool = True,
         truncate: bool = False,
-        chunk_size: int = 10,
+        chunk_size: int = 2,
         max_skips: int = 2,
     ) -> Dict[str, Any]:
         """
         Packs sequences until max length is reached. Can exclude query and use deterministic ordering.
-
+        
         Args:
             query_id_or_sequence: Either a UniRef ID to lookup in fasta_dataset, or the actual sequence
             member_ids: List of UniRef IDs or sequences for passages
@@ -99,111 +101,86 @@ class PromoterDataset(Dataset):
         def truncate_sequence(seq: str, max_len: int) -> str:
             """Helper to truncate a sequence to max length while accounting for special tokens"""
             if len(seq) + self.num_special_characters > max_len:
-                return seq[: max_len - self.num_special_characters]
+                return seq[:max_len - self.num_special_characters]
             return seq
 
         # Retrieve and possibly truncate the query
-        query_sequence = (
-            self.get_sequence(query_id_or_sequence, fasta_dataset)
-            if include_query
-            else None
-        )
-
-        query_length = (
-            len(query_sequence) + self.num_special_characters
-            if query_sequence
-            else None
-        )
-
+        query_sequence = self.queries[query_id_or_sequence] # human sequence
+        
+        # Apply individual sequence length limit if specified
+        if max_individual_seq_length and query_sequence:
+            query_sequence = truncate_sequence(query_sequence, max_individual_seq_length)
+        
+        query_length = len(query_sequence) + self.num_special_characters if query_sequence else None
+        
         # Calculate effective length for passages
-        effective_length = max_seq_length - (
-            query_length if query_length is not None else 0
-        )
-
+        effective_length = max_seq_length - (query_length if query_length is not None else 0)
+        
         passages = []
         passage_lengths = []
         total_tokens = query_length if query_length is not None else 0
         leftover = effective_length
 
-        if member_ids and len(member_ids) > 0:
-            if sample:
-                member_weights = np.array(
-                    weights
-                    if weights is not None
-                    else [1.0 / len(member_ids)] * len(member_ids)
-                )
-                member_weights /= member_weights.sum()
-
-                skip_rounds = 0
-                while leftover > 0 and skip_rounds < max_skips:
-                    sampled_ids = np.random.choice(
-                        member_ids, size=chunk_size, replace=True, p=member_weights
-                    )
-                    added = False
-
-                    for mid in sampled_ids:
-                        seq = self.get_sequence(mid, fasta_dataset)
-                        if not seq:
-                            continue
-
-                        seq_len = len(seq) + self.num_special_characters
-                        if seq_len <= leftover:
-                            passages.append(seq)
-                            passage_lengths.append(seq_len)
-                            leftover -= seq_len
-                            total_tokens += seq_len
-                            added = True
-                        elif truncate and leftover > 0:
-                            # Truncate to fit remaining space
-                            trunc_len = leftover - self.num_special_characters
-                            seq = seq[:trunc_len]
-                            passages.append(seq)
-                            passage_lengths.append(leftover)
-                            total_tokens += leftover
-                            leftover = 0
-                            added = True
-                            break
-
-                        if leftover <= 0:
-                            break
-
-                    skip_rounds = 0 if added else skip_rounds + 1
-            else:
-                # Sequential processing with length limits
-                for mid in member_ids:
-                    seq = self.get_sequence(mid, fasta_dataset)
+        
+        member_ids = list(self.sequences[query_id_or_sequence])
+        if sample:
+            member_weights = np.array(weights if weights is not None else [1.0 / len(member_ids)] * len(member_ids))
+            member_weights /= member_weights.sum()
+            
+            skip_rounds = 0
+            while leftover > 0 and skip_rounds < max_skips:
+                sampled_ids = np.random.choice(member_ids, size=chunk_size, replace=True, p=member_weights)
+                added = False
+                
+                for seq in sampled_ids:
                     if not seq:
                         continue
-
+                    
+                    # Apply individual sequence length limit if specified
+                    if max_individual_seq_length:
+                        seq = truncate_sequence(seq, max_individual_seq_length)
+                    
                     seq_len = len(seq) + self.num_special_characters
                     if seq_len <= leftover:
                         passages.append(seq)
                         passage_lengths.append(seq_len)
                         leftover -= seq_len
                         total_tokens += seq_len
+                        added = True
                     elif truncate and leftover > 0:
-                        seq = seq[: leftover - self.num_special_characters]
+                        # Truncate to fit remaining space
+                        trunc_len = leftover - self.num_special_characters
+                        seq = seq[:trunc_len]
                         passages.append(seq)
                         passage_lengths.append(leftover)
                         total_tokens += leftover
                         leftover = 0
+                        added = True
                         break
-
+                    
+                    if leftover <= 0:
+                        break
+                        
+                skip_rounds = 0 if added else skip_rounds + 1
+           
+                        
         return {
             "id": query_id_or_sequence if include_query else None,
             "sequence": query_sequence,
             "passages": passages,
             "passage_lengths": passage_lengths,
             "query_length": query_length,
-            "total_tokens": total_tokens,
+            "total_tokens": total_tokens
         }
 
     def pack_inputs(
-        self,
-        sample: str,
+        self, 
+        sample, 
+        tokenizer,  # DNA tokenizer instance
+        max_seq_length, 
         padding_idx=IGNORE_INDEX,
         reverse_sequence=False,
-        skip_padding=True,
+        skip_padding=True
     ):
         """
         Packs a single sample's query and passages into a single sequence, using Uniprot21 tokenization.
@@ -220,7 +197,7 @@ class PromoterDataset(Dataset):
             max_seq_length (int): Maximum length of the packed sequence
             padding_idx (int): Token ID to use for padding
             cls_token (str): Start token character ($ for Uniprot21)
-            eos_token (str): Stop token character (* for Uniprot21)
+            eos_token (str): Stop token character (* for Uniprot21) 
             reverse_sequence (bool): If True, reverse sequences before tokenization
             skip_padding (bool): If True, don't pad sequence to max_seq_length
 
@@ -232,12 +209,12 @@ class PromoterDataset(Dataset):
 
         Example:
             For sequence ABC, passages [DEF, GH] and max_seq_length=14:
-
+            
             Normal order (reverse_sequence=False):
                 tokens:  [$ D E F * $ G H * $ A B C * <pad>]
                 seq_lens: [5, 4, 5]  # Each sequence length includes its start/stop tokens
                 labels:  [$ D E F * $ G H * $ A B C * -100]
-
+                
             Reversed (reverse_sequence=True):
                 tokens:  [* F E D $ * H G $ * C B A $ <pad>]
                 seq_lens: [5, 4, 5]  # Lengths stay same, just content is reversed
@@ -250,61 +227,59 @@ class PromoterDataset(Dataset):
         """
     [previous docstring remains the same]
     """
-
         def tokenize_sequence(text: str, reverse_sequence: bool) -> np.ndarray:
             if reverse_sequence:
                 text = text[::-1]
             if isinstance(text, str):
-                text_bytes = text.encode("ascii")
+                text_bytes = text.encode('ascii')
             else:
                 text_bytes = text  # Already bytes
-            tokens = self.alphabet.encode(text_bytes)
+            tokens = tokenizer.encode(text_bytes)
             if reverse_sequence:
-                return np.concatenate(
-                    [[self.alpahbet.stop_token], tokens, [self.alphabet.start_token]]
-                )
+                return np.concatenate([[tokenizer.stop_token], tokens, [tokenizer.start_token]])
             else:
-                return np.concatenate(
-                    [[self.alphabet.start_token], tokens, [self.alphabet.stop_token]]
-                )
-
-        def truncate_sequence(seq: str, max_len: int) -> str:
-            """Helper to truncate a sequence to max length while accounting for special tokens"""
-            if len(seq) + self.num_special_characters > max_len:
-                return seq[: max_len - self.num_special_characters]
-            return seq
+                return np.concatenate([[tokenizer.start_token], tokens, [tokenizer.stop_token]])
 
         # Initialize sequences and lengths
         all_sequences = []
-        all_lengths = []
-
-        for query_sequence in self.sequences[sample]:
+        all_lengths = sample["passage_lengths"].copy()  # Use pre-calculated passage lengths
+        
+        # Process passages
+        if sample["passages"]:
+            for seq in sample["passages"]:
+                if seq is not None:
+                    tokens = tokenize_sequence(seq, reverse_sequence)
+                    all_sequences.append(tokens)
+        
+        
+        # Process query if it exists
+        query_sequence = sample["sequence"]
+        if query_sequence is not None:
             tokens = tokenize_sequence(query_sequence, reverse_sequence)
             all_sequences.append(tokens)
-            all_lengths.append(len(tokens))
-
+            # Use pre-calculated query length
+            all_lengths.append(sample["query_length"])
+        
         # Concatenate all sequences
         if all_sequences:
             tokens = np.concatenate(all_sequences)
             tokens = torch.from_numpy(tokens).long()
         else:
             tokens = torch.empty(0, dtype=torch.long)
-
+        
         # Add padding if needed
         current_length = sum(all_lengths)
-        if not skip_padding and current_length < self.max_len:
-            padding_length = self.max_len - current_length
+        if not skip_padding and current_length < max_seq_length:
+            padding_length = max_seq_length - current_length
             all_lengths.append(padding_length)
             padding = torch.full((padding_length,), padding_idx, dtype=tokens.dtype)
             tokens = torch.cat([tokens, padding])
-
-        # # Create labels (same as tokens but with padding masked)
-        # labels = tokens.clone()
+        
+        # Create labels (same as tokens but with padding masked)
 
         return {
             "tokens": tokens,
             "seq_lens": all_lengths,
-            "label": sample,
         }
 
     def padded_collate_packed(
@@ -333,7 +308,7 @@ class PromoterDataset(Dataset):
         # If pad_mode is None, default to "largest"
         if pad_mode is None:
             pad_mode = "largest"
-
+        
         # Determine target length for tokens
         token_lengths = [x["tokens"].size(0) for x in batch]
         if pad_mode == "largest":
@@ -348,18 +323,15 @@ class PromoterDataset(Dataset):
             raise ValueError("Unknown pad_mode. Use 'largest', 'fixed', or None.")
 
         padded_tokens = []
-        # padded_labels = []
+   
         for x in batch:
             token = x["tokens"]
-            label = x["label"]
             pad_len = target_length - token.size(0)
             if pad_len > 0:
                 token = F.pad(token, (0, pad_len), value=padding_idx)
-                label = F.pad(label, (0, pad_len), value=padding_idx)
             padded_tokens.append(token)
-            # padded_labels.append(torch.Tensor([label]))
         tokens_tensor = torch.stack(padded_tokens, dim=0)
-        # labels_tensor = torch.stack(padded_labels, dim=0)
+
 
         # Collate segment sizes (each sample may have several segments).
         max_segments = max(len(x["seq_lens"]) for x in batch)
@@ -371,17 +343,21 @@ class PromoterDataset(Dataset):
 
         collated_batch = {
             "tokens": tokens_tensor,
-            # "labels": labels_tensor,
             "segment_sizes": segment_sizes,
         }
-        # collated_batch = self._to_cuda(collated_batch)
+       
+        collated_batch = self._to_cuda(collated_batch)
         return collated_batch
 
     def __len__(self):
         return len(self.sequences)
 
     def _to_cuda(self, tok_dict):
-        return {k: v.to("cuda") for k, v in tok_dict.items()}
+        return {k: v.long().cuda() for k, v in tok_dict.items()}
+    
+    @staticmethod
+    def train_validation_split(chr: int, sequences: dict, queries: dict) -> Tuple[Dict, Dict, Dict, Dict]:
+        return sequences, queries, sequences, queries
 
 
 """ no idea what this does, but the poet people use it to warm up the model
@@ -402,7 +378,7 @@ class PromoterModel(lightning.LightningModule):
         super().__init__()
         # ckpt = torch.load(ckpt_path)
         init = {
-            "n_vocab": 24,
+            "n_vocab": 7,
             "hidden_dim": 1024,
             "num_layers": 12,
             "nhead": 16,
@@ -413,6 +389,7 @@ class PromoterModel(lightning.LightningModule):
         self.model = PoET(**init).cuda().half()
 
     def forward(self, xs: torch.Tensor, segment_sizes: torch.Tensor) -> torch.Tensor:
+        # print(xs.shape, segment_sizes.shape)
         return self.model(xs, segment_sizes)
 
     def training_step(self, batch, batch_idx):
@@ -420,7 +397,7 @@ class PromoterModel(lightning.LightningModule):
         segment_sizes = batch["segment_sizes"]
         logits = self(xs, segment_sizes)
 
-        # Calculate loss (assuming next token prediction)
+        # Calculate loss (next token prediction)
         targets = xs[:, 1:].contiguous()  # Shift targets by 1
         logits = logits[:, :-1, :].contiguous()  # Remove last logit
         loss = F.cross_entropy(
@@ -428,16 +405,39 @@ class PromoterModel(lightning.LightningModule):
             targets.view(-1),
             ignore_index=IGNORE_INDEX,
         )
-
+        print('loss', loss)
         self.log("train_loss", loss)
+        return loss
+    
+    def validation_step(self, batch, batch_idx):
+        xs = batch["tokens"]
+        segment_sizes = batch["segment_sizes"]
+        logits = self(xs, segment_sizes)
+
+        # Calculate loss (next token prediction)
+        targets = xs[:, 1:].contiguous()  # Shift targets by 1
+        logits = logits[:, :-1, :].contiguous()  # Remove last logit
+        print(targets, logits)
+        loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=IGNORE_INDEX,
+        )
+
+        self.log("validation_loss", loss)
         return loss
 
     def configure_optimizers(self):
-        return Adafactor(
-            self.model.parameters(),
-            lr=1e-2,
-        )
-
+        # return Adafactor(
+        #     self.model.parameters(),
+        #     lr=1e-5,
+        # )
+        return torch.optim.Adam(self.parameters(), lr=1e-9)
+    # def on_before_optimizer_step(self, optimizer):
+    # # Compute the 2-norm for each layer
+    # # If using mixed precision, the gradients are already unscaled here
+    #     norms = grad_norm(self.model.layer, norm_type=2)
+    #     print(norms)
 
 def main():
     parser = argparse.ArgumentParser(description="Train a PromoterModel")
@@ -445,7 +445,7 @@ def main():
         "--batch_size", type=int, default=2, help="Batch size for training"
     )
     parser.add_argument(
-        "--num_epochs", type=int, default=10, help="Number of training epochs"
+        "--num_epochs", type=int, default=2, help="Number of training epochs"
     )
     parser.add_argument(
         "--max_len", type=int, default=200, help="Maximum sequence length"
@@ -464,34 +464,78 @@ def main():
     )
     args = parser.parse_args()
 
-    example = {"BRCA": {"ATTC", "ATCG"}, "A19": {"ATTC", "ATGG"}}
+    example =  {
+    'OXKSZ': {'ACAGAGTAACTGC', 'CACGCAAGCGACTA', 'GGGCGGGTAGTACCC'},
+    'GHXGF': {'AAAATGGTCTGTC', 'AATAAGTGAG', 'CGCGACGCCATAGTT'},
+    'XSVNO': {'CCGATCCCGCCCGC', 'GCGGGCCGGCATGCC', 'TTTAGTTGTGTT'},
+    'LPTSW': {'ATTGCTGGACA', 'GCAGTGCCAGTTTC', 'GTCATCGTGCACAT'},
+    'SAPJM': {'AGAGGTACCC', 'CGGGTGAAATT', 'CTGGTCACGAGTT'},
+    'KNGBV': {'AGCACGCACG', 'AGTATCGCAGA', 'CGGGTAGTTGCGAAC'},
+    'YTWYS': {'AATGCAACTGGTT', 'ATGAAATTATT', 'GTACAGACCC'},
+    'IMXVE': {'TAGTGCAACC', 'TGAGACGGACGAT', 'TTTTTTACAG'},
+    'QDKFG': {'CAGGTTTGGCCTGT', 'CCCAGTTACCA', 'GTTTGACTGC'},
+    'GDLYH': {'AACGACAAGCATG', 'TACCCGAGTGTAT', 'TGGGATCTCA'},
+    'XQIRL': {'CACGTGGCGCCGCTT', 'CCGTTTTATTG', 'GTCCTTACATGCCCC'},
+    'BSKUP': {'GAGCCTCTTGCG', 'GAGCGTATCGCAGC', 'TCGACGAATG'},
+    }
+    example_query =  {
+    'OXKSZ': 'ACAGAGTAACTGC' ,
+    'GHXGF': 'AAAATGGTCTGTC',
+    'XSVNO': 'CCGATCCCGCCCGC',
+    'LPTSW': 'ATTGCTGGACA',
+    'SAPJM': 'CTGGTCACGAGTT',
+    'KNGBV': 'CGGGTAGTTGCGAAC',
+    'YTWYS': 'GTACAGACCC',
+    'IMXVE': 'TAGTGCAACC',
+    'QDKFG': 'GTTTGACTGC',
+    'GDLYH': 'TGGGATCTCA',
+    'XQIRL': 'GTCCTTACATGCCCC',
+    'BSKUP': 'TCGACGAATG',
+    }
+
+    # TODO: train, validation split into four dictionaries
+    example, example_query, val_example, val_query =PromoterDataset.train_validation_split( chr= 19, sequences=example, queries=example_query)
+
 
     alphabet = ATCG(
         mask=True, include_gap=True, include_startstop=True, distinct_startstop=True
     )
 
     model = PromoterModel()
+    # logger = WandbLogger(project = "poet")
+    train_dataset = PromoterDataset(example, example_query, alphabet, args.max_len)
+    val_dataset = PromoterDataset(val_example, val_query, alphabet, args.max_len)
 
-    dataset = PromoterDataset(example, alphabet, args.max_len)
     train_loader = DataLoader(
-        dataset,
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=dataset.padded_collate_packed,
+        collate_fn=train_dataset.padded_collate_packed,
     )
 
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=val_dataset.padded_collate_packed,
+    )
+    
     trainer = lightning.Trainer(
         max_epochs=args.num_epochs,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        # accelerator="cpu",
         devices="auto",
+        # logger=logger,
+        detect_anomaly=True
     )
 
-    jit_warmup(model, alphabet)
+    # jit_warmup(model, alphabet)
     trainer.fit(
         model,
-        train_loader,
+        train_dataloaders=train_loader,
+        val_dataloaders= val_loader,
     )
-    trainer.save_checkpoint(args.ckpt_path)
+    # trainer.save_checkpoint(args.ckpt_path)
 
 
 if __name__ == "__main__":
