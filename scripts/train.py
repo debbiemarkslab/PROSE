@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pytorch_lightning as lightning
+from pytorch_lighning.loggers import WandbLogger
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -10,6 +11,7 @@ from torch_optimizer import Adafactor
 
 from poet.alphabets import Alphabet, Uniprot21
 from poet.models.poet import PoET
+
 
 IGNORE_INDEX = -100
 
@@ -431,6 +433,23 @@ class PromoterModel(lightning.LightningModule):
 
         self.log("train_loss", loss)
         return loss
+    
+    def validation_step(self, batch, batch_idx):
+        xs = batch["tokens"]
+        segment_sizes = batch["segment_sizes"]
+        logits = self(xs, segment_sizes)
+
+        # Calculate loss (assuming next token prediction)
+        targets = xs[:, 1:].contiguous()  # Shift targets by 1
+        logits = logits[:, :-1, :].contiguous()  # Remove last logit
+        loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=IGNORE_INDEX,
+        )
+
+        self.log("validation_loss", loss)
+        return loss
 
     def configure_optimizers(self):
         return Adafactor(
@@ -480,16 +499,24 @@ def main():
         collate_fn=dataset.padded_collate_packed,
     )
 
+    # val_loader = DataLoader()
+
+    wandb_logger = WandbLogger(project = "promEVE") # TODO: change
+
     trainer = lightning.Trainer(
         max_epochs=args.num_epochs,
+        logger = wandb_logger,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices="auto",
+        # strategy = "ddp"
     )
 
-    jit_warmup(model, alphabet)
+    jit_warmup(model, alphabet) 
+
     trainer.fit(
         model,
         train_loader,
+        # val_loader
     )
     trainer.save_checkpoint(args.ckpt_path)
 
