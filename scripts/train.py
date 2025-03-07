@@ -11,10 +11,11 @@ from torch_optimizer import Adafactor
 from poet.alphabets import Alphabet, Uniprot21
 from poet.models.poet import PoET
 import random 
-# from pytorch_lightning.loggers.wandb import WandbLogger
-# from pytorch_lightning.utilities.grads import grad_norm
+
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.utilities.grads import grad_norm
+import math
+
 IGNORE_INDEX = -100
 
 
@@ -362,9 +363,6 @@ class PromoterDataset(Dataset):
         return sequences, queries, sequences, queries
 
 
-""" no idea what this does, but the poet people use it to warm up the model
-"""
-
 
 def jit_warmup(embedding_model: PoET, alphabet: Uniprot21):
     x = b"$WAAAGH*$WAAGW*"
@@ -375,6 +373,45 @@ def jit_warmup(embedding_model: PoET, alphabet: Uniprot21):
     x = embedding_model(x.unsqueeze(0), segment_sizes.unsqueeze(0))
     print("warmup", x)
 
+
+class SqrtDecayScheduler(torch.optim.lr_scheduler._LRScheduler):
+    ''' they claim they use this in the paper,
+        couldn't find any info on this so this is fully AI-generated
+    '''
+    def __init__(self, 
+                 optimizer,
+                 last_epoch: int = -1,
+                 verbose: bool = False,
+                 scaling_factor: float = 1.0,
+                 offset: int = 0):
+        
+        self.scaling_factor = scaling_factor
+        self.offset = offset
+        super().__init__(optimizer, last_epoch, verbose)
+        
+    def get_lr(self) -> list[float]:
+        """Compute scaled learning rate using sqrt decay"""
+        return [base_lr * self.scaling_factor / math.sqrt(self.last_epoch + 1 + self.offset)
+                for base_lr in self.base_lrs]
+
+    def theoretical_bound(self, 
+                         total_steps: int,
+                         gradient_bound: float) -> float:
+        """
+        Theoretical convergence bound for convex functions with L-Lipschitz gradients:
+        
+        f(x̄_T) - f(x^*) ≤ (2D²L + D√(2σ²T)) / √T
+        
+        Where:
+        - D: Diameter of feasible set
+        - L: Lipschitz constant
+        - σ²: Gradient variance bound
+        - T: Total number of steps
+        
+        Returns expected optimization error bound
+        """
+        return (2 * self.scaling_factor**2 * gradient_bound**2 + 
+                self.scaling_factor * math.sqrt(2 * gradient_bound**2 * total_steps)) / torch.sqrt(total_steps)
 
 class PromoterModel(lightning.LightningModule):
     def __init__(self):
@@ -406,7 +443,7 @@ class PromoterModel(lightning.LightningModule):
         # Calculate loss (next token prediction)
         targets = xs[:, 1:].contiguous()  # Shift targets by 1
         logits = logits[:, :-1, :].contiguous()  # Remove last logit
-        logits = self._clamp(logits)
+        # logits = self._clamp(logits)
         # loss = F.cross_entropy(
         #     self._clamp(logits.view(-1, logits.size(-1))),
         #     self._clamp(targets.view(-1)),
@@ -460,10 +497,12 @@ class PromoterModel(lightning.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        return Adafactor(
+        opt =  Adafactor(
             self.model.parameters(),
             lr=1e-2,
         )
+        # scheduler = SqrtDecayScheduler(opt)
+        return [opt]#, [scheduler]
         # return torch.optim.Adam(self.model.parameters(), lr=1e-3)
     
     def initialize_model(self):
@@ -471,7 +510,6 @@ class PromoterModel(lightning.LightningModule):
         for param in self.model.parameters():
             if param.dim() > 1:
                 torch.nn.init.kaiming_uniform_(param)
-
 
 
     def on_before_optimizer_step(self, optimizer):
@@ -575,6 +613,8 @@ def main():
         devices="auto",
         logger=logger,
         detect_anomaly=True,
+        log_every_n_steps=10,
+        precision="bf16"
         # gradient_clip_val=0.5,
         # gradient_clip_algorithm="value"
     )
