@@ -2,7 +2,7 @@ import argparse
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import pytorch_lightning as lightning
+import lightning
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -11,8 +11,10 @@ from torch_optimizer import Adafactor
 from poet.alphabets import Alphabet, Uniprot21
 from poet.models.poet import PoET
 import random 
-from pytorch_lightning.loggers.wandb import WandbLogger
-from pytorch_lightning.utilities.grads import grad_norm
+# from pytorch_lightning.loggers.wandb import WandbLogger
+# from pytorch_lightning.utilities.grads import grad_norm
+from lightning.pytorch.loggers.wandb import WandbLogger
+from lightning.pytorch.utilities.grads import grad_norm
 IGNORE_INDEX = -100
 
 
@@ -370,7 +372,8 @@ def jit_warmup(embedding_model: PoET, alphabet: Uniprot21):
     x = alphabet.encode(x)  # encode x into the uniprot21 alphabet
     x = torch.from_numpy(x).long().cuda()
     segment_sizes = torch.tensor(segment_sizes).long().cuda()
-    _ = embedding_model(x.unsqueeze(0), segment_sizes.unsqueeze(0))
+    x = embedding_model(x.unsqueeze(0), segment_sizes.unsqueeze(0))
+    print("warmup", x)
 
 
 class PromoterModel(lightning.LightningModule):
@@ -378,7 +381,7 @@ class PromoterModel(lightning.LightningModule):
         super().__init__()
         # ckpt = torch.load(ckpt_path)
         init = {
-            "n_vocab": 7,
+            "n_vocab": 24,
             "hidden_dim": 1024,
             "num_layers": 12,
             "nhead": 16,
@@ -386,28 +389,56 @@ class PromoterModel(lightning.LightningModule):
             "use_multi_rotary": True,
             "norm": True,
         }
-        self.model = PoET(**init).cuda().half()
+        self.model = PoET(**init).cuda()
 
     def forward(self, xs: torch.Tensor, segment_sizes: torch.Tensor) -> torch.Tensor:
+        if (torch.isnan(xs).any() or torch.isnan(segment_sizes).any()):
+            raise Exception("NAN in INPUT!!")
+        
         # print(xs.shape, segment_sizes.shape)
         return self.model(xs, segment_sizes)
 
     def training_step(self, batch, batch_idx):
         xs = batch["tokens"]
         segment_sizes = batch["segment_sizes"]
-        logits = self(xs, segment_sizes)
+        logits = self.model(xs, segment_sizes)
 
         # Calculate loss (next token prediction)
         targets = xs[:, 1:].contiguous()  # Shift targets by 1
         logits = logits[:, :-1, :].contiguous()  # Remove last logit
-        loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            targets.view(-1),
-            ignore_index=IGNORE_INDEX,
+        logits = self._clamp(logits)
+        # loss = F.cross_entropy(
+        #     self._clamp(logits.view(-1, logits.size(-1))),
+        #     self._clamp(targets.view(-1)),
+        #     ignore_index=IGNORE_INDEX,
+        # )
+        # logits = torch.nn.functional.softmax(logits, dim=-1)
+        # print(logits.sum(dim=-1))
+        sequence_loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            targets.reshape(-1),
+            reduction='mean',
+            ignore_index=IGNORE_INDEX
         )
-        print('loss', loss)
-        self.log("train_loss", loss)
-        return loss
+        
+        # # Reshape loss and apply mask
+        # loss = loss.reshape(logits.size(0), -1)
+        # valid_positions = (targets != -100).float()
+        # sequence_loss = ((loss * valid_positions).sum(dim=1) / (valid_positions.sum(dim=1))).mean()
+        
+        # Handle any NaN or Inf values
+        if not torch.isfinite(sequence_loss).all():
+            print(sequence_loss)
+            # self.log(f'nan_inf_detected', 1.0, sync_dist=True)
+            sequence_loss = torch.where(
+                torch.isfinite(sequence_loss), 
+                sequence_loss, 
+                torch.tensor(0.0, device=sequence_loss.device)
+            )
+            self.zero_grad()
+        self.log("train_loss", sequence_loss)
+
+        return sequence_loss
     
     def validation_step(self, batch, batch_idx):
         xs = batch["tokens"]
@@ -417,27 +448,41 @@ class PromoterModel(lightning.LightningModule):
         # Calculate loss (next token prediction)
         targets = xs[:, 1:].contiguous()  # Shift targets by 1
         logits = logits[:, :-1, :].contiguous()  # Remove last logit
-        print(targets, logits)
+      
         loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            targets.view(-1),
+            self._clamp(logits.view(-1, logits.size(-1))),
+            self._clamp(targets.view(-1)),
             ignore_index=IGNORE_INDEX,
+            reduction='mean'
         )
 
         self.log("validation_loss", loss)
         return loss
 
     def configure_optimizers(self):
-        # return Adafactor(
-        #     self.model.parameters(),
-        #     lr=1e-5,
-        # )
-        return torch.optim.Adam(self.parameters(), lr=1e-9)
-    # def on_before_optimizer_step(self, optimizer):
-    # # Compute the 2-norm for each layer
-    # # If using mixed precision, the gradients are already unscaled here
-    #     norms = grad_norm(self.model.layer, norm_type=2)
-    #     print(norms)
+        return Adafactor(
+            self.model.parameters(),
+            lr=1e-2,
+        )
+        # return torch.optim.Adam(self.model.parameters(), lr=1e-3)
+    
+    def initialize_model(self):
+        self.model.train()
+        for param in self.model.parameters():
+            if param.dim() > 1:
+                torch.nn.init.kaiming_uniform_(param)
+
+
+
+    def on_before_optimizer_step(self, optimizer):
+    # Compute the 2-norm for each layer
+    # If using mixed precision, the gradients are already unscaled here
+        # norms = grad_norm(self.model.layer, norm_type=2)
+        # print(norms)
+        pass
+
+    def _clamp(self, x: torch.Tensor, minimum=0.0001) -> torch.Tensor:
+        return x.clamp(min=torch.Tensor([minimum]).to(x.dtype).cuda())
 
 def main():
     parser = argparse.ArgumentParser(description="Train a PromoterModel")
@@ -445,7 +490,7 @@ def main():
         "--batch_size", type=int, default=2, help="Batch size for training"
     )
     parser.add_argument(
-        "--num_epochs", type=int, default=2, help="Number of training epochs"
+        "--num_epochs", type=int, default=10, help="Number of training epochs"
     )
     parser.add_argument(
         "--max_len", type=int, default=200, help="Maximum sequence length"
@@ -453,7 +498,7 @@ def main():
     parser.add_argument(
         "--initial_learning_rate",
         type=float,
-        default=1e-2,
+        default=1e-12,
         help="Initial learning rate",
     )
     parser.add_argument(
@@ -494,7 +539,7 @@ def main():
     }
 
     # TODO: train, validation split into four dictionaries
-    example, example_query, val_example, val_query =PromoterDataset.train_validation_split( chr= 19, sequences=example, queries=example_query)
+    example, example_query, val_example, val_query = PromoterDataset.train_validation_split( chr= 19, sequences=example, queries=example_query)
 
 
     alphabet = ATCG(
@@ -502,7 +547,10 @@ def main():
     )
 
     model = PromoterModel()
-    # logger = WandbLogger(project = "poet")
+    
+    model.initialize_model()
+
+    logger = WandbLogger(project = "poet")
     train_dataset = PromoterDataset(example, example_query, alphabet, args.max_len)
     val_dataset = PromoterDataset(val_example, val_query, alphabet, args.max_len)
 
@@ -525,18 +573,53 @@ def main():
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         # accelerator="cpu",
         devices="auto",
-        # logger=logger,
-        detect_anomaly=True
+        logger=logger,
+        detect_anomaly=True,
+        # gradient_clip_val=0.5,
+        # gradient_clip_algorithm="value"
     )
-
-    # jit_warmup(model, alphabet)
+    # uniprot = Uniprot21()
+    # jit_warmup(model, uniprot)
     trainer.fit(
         model,
         train_dataloaders=train_loader,
         val_dataloaders= val_loader,
     )
     # trainer.save_checkpoint(args.ckpt_path)
+    # s1 = train_dataset.sample_and_fit_sequences('OXKSZ', weights = None, max_individual_seq_length=None, max_seq_length=1024)
+    # s1 = train_dataset.pack_inputs(s1, alphabet, 1024)
+    # s2 = train_dataset.sample_and_fit_sequences('KNGBV', weights = None, max_individual_seq_length=None, max_seq_length=1024)
+    # s2 = train_dataset.pack_inputs(s2, alphabet, 1024)
+    # sets = train_dataset.padded_collate_packed([s1, s2]) 
+    # print(model(sets['tokens'], sets['segment_sizes']))
+    # optimizer = model.configure_optimizers()
+    # loss_fn = torch.nn.functional.cross_entropy
+    # for epoch in range(2):
+    #     model.train()  # Set model to training mode
+    #     total_loss = 0
+    #     for batch_idx, batch in enumerate(train_loader):
+    #         # Forward pass
+    #         xs = batch["tokens"]
+    #         segment_sizes = batch["segment_sizes"]
+    #         logits = model(xs, segment_sizes)
 
+    #         # Calculate loss (next token prediction)
+    #         targets = xs[:, 1:].contiguous()  # Shift targets by 1
+    #         logits = logits[:, :-1, :].contiguous()
+            
+    #         loss = loss_fn(logits.reshape(-1, logits.size(-1)),
+    #                         targets.reshape(-1),
+    #                         reduction='mean',
+    #                         ignore_index=IGNORE_INDEX)
+    #         print(loss) 
+            
+    #         # Backward pass
+    #         optimizer.zero_grad()
+    #         loss.backward()
+    #         # Update model parameters
+    #         optimizer.step()
+    #         # Accumulate loss
+    #         total_loss += loss.item()
 
 if __name__ == "__main__":
     main()
