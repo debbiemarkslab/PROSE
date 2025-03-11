@@ -1,5 +1,5 @@
 import argparse
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import lightning
@@ -61,12 +61,16 @@ class PromoterDataset(Dataset):
         self.queries = queries
         self.num_special_characters = 2
         self.ids = list(sequences.keys())
+        self.sampling_weights = [len(v) for k, v in self.sequences.items()]
+        total = sum(self.sampling_weights)
+        self.sampling_weights = [ i / total for i in self.sampling_weights]
         self.max_len = max_length
+        self.iters = 20
 
     def __getitem__(self, idx):
         # randomly sample a gene with replacement, perhaps add weights here  
-        id = random.choice(self.ids)
-        sampled_set = self.sample_and_fit_sequences(id, weights = None, max_individual_seq_length=None, max_seq_length=1024)
+        id = np.random.choice(self.ids, p = self.sampling_weights)
+        sampled_set = self.sample_and_fit_sequences(id, weights = None, max_individual_seq_length=None, max_seq_length=self.max_len)
         return self.pack_inputs(sampled_set, self.alphabet, self.max_len)
 
     def sample_and_fit_sequences(
@@ -353,7 +357,7 @@ class PromoterDataset(Dataset):
         return collated_batch
 
     def __len__(self):
-        return len(self.sequences)
+        return self.iters
 
     def _to_cuda(self, tok_dict):
         return {k: v.long().cuda() for k, v in tok_dict.items()}
@@ -361,6 +365,25 @@ class PromoterDataset(Dataset):
     @staticmethod
     def train_validation_split(chr: int, sequences: dict, queries: dict) -> Tuple[Dict, Dict, Dict, Dict]:
         return sequences, queries, sequences, queries
+    @staticmethod
+    def _train_validation_split(chr: Union[int|str], sequences: dict, queries: dict) -> Tuple[Dict, Dict, Dict, Dict]:
+        train_seq = {}
+        train_query = {}
+        val_seq = {}
+        val_query = {}
+        chr_pattern = f"_chr{chr}"
+        for key in sequences.keys():
+            if key not in queries:
+                continue
+            if chr_pattern in key:
+                val_seq[key] = sequences[key]
+                val_query[key] = queries[key]
+            else:
+                train_seq[key] = sequences[key]
+                train_query[key] = queries[key]
+        return train_seq, train_query, val_seq, val_query   
+
+
 
 
 
@@ -473,8 +496,10 @@ class PromoterModel(lightning.LightningModule):
                 torch.tensor(0.0, device=sequence_loss.device)
             )
             self.zero_grad()
-        self.log("train_loss", sequence_loss)
 
+        perplexity = torch.exp(sequence_loss)
+        self.log("train_loss", sequence_loss)
+        self.log("train_perplexity", perplexity)
         return sequence_loss
     
     def validation_step(self, batch, batch_idx):
@@ -492,8 +517,11 @@ class PromoterModel(lightning.LightningModule):
             ignore_index=IGNORE_INDEX,
             reduction='mean'
         )
+        perplexity = torch.exp(loss)
 
         self.log("validation_loss", loss)
+        self.log("validation_perplexity", perplexity)
+
         return loss
 
     def configure_optimizers(self):
@@ -528,10 +556,10 @@ def main():
         "--batch_size", type=int, default=2, help="Batch size for training"
     )
     parser.add_argument(
-        "--num_epochs", type=int, default=10, help="Number of training epochs"
+        "--num_epochs", type=int, default=6, help="Number of training epochs"
     )
     parser.add_argument(
-        "--max_len", type=int, default=200, help="Maximum sequence length"
+        "--max_len", type=int, default=2000, help="Maximum sequence length"
     )
     parser.add_argument(
         "--initial_learning_rate",
@@ -553,13 +581,13 @@ def main():
     'XSVNO': {'CCGATCCCGCCCGC', 'GCGGGCCGGCATGCC', 'TTTAGTTGTGTT'},
     'LPTSW': {'ATTGCTGGACA', 'GCAGTGCCAGTTTC', 'GTCATCGTGCACAT'},
     'SAPJM': {'AGAGGTACCC', 'CGGGTGAAATT', 'CTGGTCACGAGTT'},
-    'KNGBV': {'AGCACGCACG', 'AGTATCGCAGA', 'CGGGTAGTTGCGAAC'},
+    'KNGBV': {'AGCACGCACG'},
     'YTWYS': {'AATGCAACTGGTT', 'ATGAAATTATT', 'GTACAGACCC'},
-    'IMXVE': {'TAGTGCAACC', 'TGAGACGGACGAT', 'TTTTTTACAG'},
+    'IMXVE': {'TAGTGCAACC', 'TGAGACGGACGAT',},
     'QDKFG': {'CAGGTTTGGCCTGT', 'CCCAGTTACCA', 'GTTTGACTGC'},
     'GDLYH': {'AACGACAAGCATG', 'TACCCGAGTGTAT', 'TGGGATCTCA'},
     'XQIRL': {'CACGTGGCGCCGCTT', 'CCGTTTTATTG', 'GTCCTTACATGCCCC'},
-    'BSKUP': {'GAGCCTCTTGCG', 'GAGCGTATCGCAGC', 'TCGACGAATG'},
+    'BSKUP': {'GAGCCTCTTGCG', 'GAGCGTATCGCAGC'},
     }
     example_query =  {
     'OXKSZ': 'ACAGAGTAACTGC' ,
@@ -625,41 +653,7 @@ def main():
         train_dataloaders=train_loader,
         val_dataloaders= val_loader,
     )
-    # trainer.save_checkpoint(args.ckpt_path)
-    # s1 = train_dataset.sample_and_fit_sequences('OXKSZ', weights = None, max_individual_seq_length=None, max_seq_length=1024)
-    # s1 = train_dataset.pack_inputs(s1, alphabet, 1024)
-    # s2 = train_dataset.sample_and_fit_sequences('KNGBV', weights = None, max_individual_seq_length=None, max_seq_length=1024)
-    # s2 = train_dataset.pack_inputs(s2, alphabet, 1024)
-    # sets = train_dataset.padded_collate_packed([s1, s2]) 
-    # print(model(sets['tokens'], sets['segment_sizes']))
-    # optimizer = model.configure_optimizers()
-    # loss_fn = torch.nn.functional.cross_entropy
-    # for epoch in range(2):
-    #     model.train()  # Set model to training mode
-    #     total_loss = 0
-    #     for batch_idx, batch in enumerate(train_loader):
-    #         # Forward pass
-    #         xs = batch["tokens"]
-    #         segment_sizes = batch["segment_sizes"]
-    #         logits = model(xs, segment_sizes)
-
-    #         # Calculate loss (next token prediction)
-    #         targets = xs[:, 1:].contiguous()  # Shift targets by 1
-    #         logits = logits[:, :-1, :].contiguous()
-            
-    #         loss = loss_fn(logits.reshape(-1, logits.size(-1)),
-    #                         targets.reshape(-1),
-    #                         reduction='mean',
-    #                         ignore_index=IGNORE_INDEX)
-    #         print(loss) 
-            
-    #         # Backward pass
-    #         optimizer.zero_grad()
-    #         loss.backward()
-    #         # Update model parameters
-    #         optimizer.step()
-    #         # Accumulate loss
-    #         total_loss += loss.item()
+   
 
 if __name__ == "__main__":
     main()
