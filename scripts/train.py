@@ -11,7 +11,9 @@ from torch_optimizer import Adafactor
 from poet.alphabets import Alphabet, Uniprot21
 from poet.models.poet import PoET
 import random 
-
+import pickle
+from tqdm import tqdm
+from scipy.special import comb
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.utilities.grads import grad_norm
 import math
@@ -61,13 +63,28 @@ class PromoterDataset(Dataset):
         self.queries = queries
         self.num_special_characters = 2
         self.ids = list(sequences.keys())
+        self.sample_weights = [len(v) for _, v in sequences.items()]
         self.max_len = max_length
+        self.num_iters = 20000
+        # self.sample_weights = np.array(self.sample_weights, dtype=np.float64)
+        # self.sample_weights /= (self.sample_weights).sum()
+        print(f"Training for {self.num_iters} iterations per epoch")
 
+        
+ 
     def __getitem__(self, idx):
-        # randomly sample a gene with replacement, perhaps add weights here  
-        id = random.choice(self.ids)
-        sampled_set = self.sample_and_fit_sequences(id, weights = None, max_individual_seq_length=None, max_seq_length=1024)
-        return self.pack_inputs(sampled_set, self.alphabet, self.max_len)
+        # sample a gene with replacement, perhaps add weights here  
+       
+        id = random.choice(self.ids, 
+                                  # p = self.sample_weights
+                                  )
+
+        
+        sampled_set = self.sample_and_fit_sequences(id, weights = None, max_individual_seq_length=None, max_seq_length=self.max_len)
+        return self.pack_inputs(sampled_set, self.alphabet, self.max_len,
+                                # reverse_sequence=random.choice([True, False]
+                                                               ) # randomly reverse 
+
 
     def sample_and_fit_sequences(
         self,
@@ -353,14 +370,44 @@ class PromoterDataset(Dataset):
         return collated_batch
 
     def __len__(self):
-        return len(self.sequences)
+        return self.num_iters
 
     def _to_cuda(self, tok_dict):
-        return {k: v.long().cuda() for k, v in tok_dict.items()}
+        return {k: v.long() for k, v in tok_dict.items()}
     
     @staticmethod
     def train_validation_split(chr: int, sequences: dict, queries: dict) -> Tuple[Dict, Dict, Dict, Dict]:
-        return sequences, queries, sequences, queries
+        """
+        Split sequences and queries dictionaries based on the chromosome number.
+        
+        Args:
+            chr (int): The chromosome number to filter on
+            sequences (dict): Dictionary with keys in format 'geneName_chrX'
+            queries (dict): Dictionary with keys in format 'geneName_chrX'
+            
+        Returns:
+            Tuple[Dict, Dict, Dict, Dict]: A tuple containing:
+                - sequences_train: sequences not matching the chromosome
+                - sequences_val: sequences matching the chromosome
+                - queries_train: queries not matching the chromosome
+                - queries_val: queries matching the chromosome
+        """
+        sequences_train = {}
+        sequences_val = {}
+        queries_train = {}
+        queries_val = {}
+        chr_pattern = f"_chr{chr}"
+
+        for key in tqdm(sequences.keys()):
+            if chr_pattern in key and key in queries:
+                sequences_val[key] = sequences[key]
+                queries_val[key] = queries[key]
+            elif key in queries:
+                sequences_train[key] = sequences[key]
+                queries_train[key] = queries[key]
+        print(f"Training data size: {len(sequences_train.keys())} ")
+        print(f"Validation data size: {len(sequences_val.keys())} ")
+        return sequences_train, sequences_val, queries_train, queries_val
 
 
 
@@ -443,26 +490,14 @@ class PromoterModel(lightning.LightningModule):
         # Calculate loss (next token prediction)
         targets = xs[:, 1:].contiguous()  # Shift targets by 1
         logits = logits[:, :-1, :].contiguous()  # Remove last logit
-        # logits = self._clamp(logits)
-        # loss = F.cross_entropy(
-        #     self._clamp(logits.view(-1, logits.size(-1))),
-        #     self._clamp(targets.view(-1)),
-        #     ignore_index=IGNORE_INDEX,
-        # )
-        # logits = torch.nn.functional.softmax(logits, dim=-1)
-        # print(logits.sum(dim=-1))
+     
         sequence_loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
             targets.reshape(-1),
             reduction='mean',
             ignore_index=IGNORE_INDEX
         )
-        
-        # # Reshape loss and apply mask
-        # loss = loss.reshape(logits.size(0), -1)
-        # valid_positions = (targets != -100).float()
-        # sequence_loss = ((loss * valid_positions).sum(dim=1) / (valid_positions.sum(dim=1))).mean()
-        
+ 
         # Handle any NaN or Inf values
         if not torch.isfinite(sequence_loss).all():
             print(sequence_loss)
@@ -474,25 +509,24 @@ class PromoterModel(lightning.LightningModule):
             )
             self.zero_grad()
         self.log("train_loss", sequence_loss)
-
         return sequence_loss
     
     def validation_step(self, batch, batch_idx):
         xs = batch["tokens"]
         segment_sizes = batch["segment_sizes"]
-        logits = self(xs, segment_sizes)
+        logits = self.model(xs, segment_sizes)
 
         # Calculate loss (next token prediction)
         targets = xs[:, 1:].contiguous()  # Shift targets by 1
         logits = logits[:, :-1, :].contiguous()  # Remove last logit
       
         loss = F.cross_entropy(
-            self._clamp(logits.view(-1, logits.size(-1))),
-            self._clamp(targets.view(-1)),
-            ignore_index=IGNORE_INDEX,
-            reduction='mean'
+            logits.reshape(-1, logits.size(-1)),
+            targets.reshape(-1),
+            reduction='mean',
+            ignore_index=IGNORE_INDEX
         )
-
+        print(loss)
         self.log("validation_loss", loss)
         return loss
 
@@ -502,7 +536,7 @@ class PromoterModel(lightning.LightningModule):
             lr=1e-2,
         )
         # scheduler = SqrtDecayScheduler(opt)
-        return [opt]#, [scheduler]
+        return [opt] #, [scheduler]
         # return torch.optim.Adam(self.model.parameters(), lr=1e-3)
     
     def initialize_model(self):
@@ -525,13 +559,13 @@ class PromoterModel(lightning.LightningModule):
 def main():
     parser = argparse.ArgumentParser(description="Train a PromoterModel")
     parser.add_argument(
-        "--batch_size", type=int, default=2, help="Batch size for training"
+        "--batch_size", type=int, default=1, help="Batch size for training"
     )
     parser.add_argument(
-        "--num_epochs", type=int, default=10, help="Number of training epochs"
+        "--num_epochs", type=int, default=8, help="Number of training epochs"
     )
     parser.add_argument(
-        "--max_len", type=int, default=200, help="Maximum sequence length"
+        "--max_len", type=int, default=5000, help="Maximum sequence length"
     )
     parser.add_argument(
         "--initial_learning_rate",
@@ -576,8 +610,14 @@ def main():
     'BSKUP': 'TCGACGAATG',
     }
 
-    # TODO: train, validation split into four dictionaries
-    example, example_query, val_example, val_query = PromoterDataset.train_validation_split( chr= 19, sequences=example, queries=example_query)
+    with open("data/hits.pkl", "rb") as f:
+        h = pickle.load(f)
+    with open("data/query.pkl", "rb") as f:
+        q = pickle.load(f)
+
+    train_seq, train_query, val_seq, val_query = PromoterDataset.train_validation_split(chr = 19, 
+                                                                                        sequences=h, 
+                                                                                        queries=q)
 
 
     alphabet = ATCG(
@@ -589,14 +629,19 @@ def main():
     model.initialize_model()
 
     logger = WandbLogger(project = "poet")
-    train_dataset = PromoterDataset(example, example_query, alphabet, args.max_len)
-    val_dataset = PromoterDataset(val_example, val_query, alphabet, args.max_len)
 
+    # train_dataset = PromoterDataset(train_seq, train_query, alphabet, args.max_len)
+    # val_dataset = PromoterDataset(val_seq, val_query, alphabet, args.max_len)
+
+    train_dataset = PromoterDataset(example, example, alphabet, args.max_len)
+    val_dataset = PromoterDataset(example, example_query, alphabet, args.max_len)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=train_dataset.padded_collate_packed,
+        num_workers = 1
+
     )
 
     val_loader = DataLoader(
@@ -604,6 +649,7 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=val_dataset.padded_collate_packed,
+        num_workers = 1
     )
     
     trainer = lightning.Trainer(
@@ -614,9 +660,9 @@ def main():
         logger=logger,
         detect_anomaly=True,
         log_every_n_steps=10,
-        precision="bf16"
-        # gradient_clip_val=0.5,
-        # gradient_clip_algorithm="value"
+        precision="bf16",
+        # num_sanity_val_steps = 0
+       
     )
     # uniprot = Uniprot21()
     # jit_warmup(model, uniprot)
