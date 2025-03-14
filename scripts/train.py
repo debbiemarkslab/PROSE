@@ -15,7 +15,7 @@ import random
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.utilities.grads import grad_norm
 import math
-
+from Levenshtein import distance as levenshtein_distance
 IGNORE_INDEX = -100
 
 
@@ -61,7 +61,7 @@ class PromoterDataset(Dataset):
 
     def __init__(self, sequences: dict, queries: dict, alphabet, max_length):
         self.alphabet = alphabet
-        self.sequences = sequences
+        self.sequences = {k : list(v) for k, v in sequences.items()}
         self.queries = queries
         self.num_special_characters = 2
         self.ids = list(sequences.keys())
@@ -78,6 +78,7 @@ class PromoterDataset(Dataset):
         '''
         id = np.random.choice(self.ids, p = self.sampling_weights)
         sampled_set = self.sample_and_fit_sequences(id, weights = None, max_individual_seq_length=None, max_seq_length=self.max_len)
+        # sampled_set = self.diverse_sample_and_fit_sequences(id)
         return self.pack_inputs(sampled_set, self.alphabet, self.max_len)
 
     def sample_query(self, id: str, p_human: float) -> str:
@@ -96,7 +97,7 @@ class PromoterDataset(Dataset):
         if human:
             return self.queries[id]
         else:
-            return np.random.choice(list(self.sequences[id]))
+            return np.random.choice(self.sequences[id])
         
     
     def diverse_sample_and_fit_sequences(
@@ -113,9 +114,8 @@ class PromoterDataset(Dataset):
         greedy sampling strategy to maximize diversity within a subset based on hamming distance 
         """
 
-
         # Retrieve and possibly truncate the query
-        query_sequence = self.queries[query_id_or_sequence] # human sequence
+        query_sequence = self.sample_query(query_id_or_sequence, 0.3) # human sequence
         
         query_length = len(query_sequence) + self.num_special_characters if query_sequence else None
         
@@ -127,7 +127,7 @@ class PromoterDataset(Dataset):
         total_tokens = query_length if query_length is not None else 0
         leftover = effective_length
 
-        sampled_ids = kdpp_select_diverse_seqs(list(self.sequences[query_id_or_sequence]), k=16)
+        sampled_ids = kdpp_select_diverse_seqs(self.sequences[query_id_or_sequence], k=16)
     
         for seq in sampled_ids:
             if not seq:
@@ -219,7 +219,7 @@ class PromoterDataset(Dataset):
         leftover = effective_length
 
         
-        member_ids = list(self.sequences[query_id_or_sequence])
+        member_ids = self.sequences[query_id_or_sequence]
         if sample:
             member_weights = np.array(weights if weights is not None else [1.0 / len(member_ids)] * len(member_ids))
             member_weights /= member_weights.sum()
@@ -675,7 +675,7 @@ def compute_similarity_matrix(strings):
             ValueError: If sequences have different lengths
         """
         if len(seq1) != len(seq2):
-            raise ValueError("Sequences must have equal length")
+            raise ValueError(f"{len(seq1)} and {len(seq2)} are not equal length")
         
         distance = 0
         for i in range(len(seq1)):
@@ -694,7 +694,7 @@ def compute_similarity_matrix(strings):
                 L[i, j] = 1.0  # Self-similarity is 1
             else:
                 # Convert dissimilarity to similarity (higher dissimilarity = lower similarity)
-                dissimilarity = hamming_distance(strings[i], strings[j])
+                dissimilarity = levenshtein_distance(strings[i], strings[j])
                 # Use RBF kernel to convert dissimilarity to similarity
                 L[i, j] = np.exp(-dissimilarity)
     

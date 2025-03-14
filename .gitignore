@@ -3,6 +3,7 @@
 _version.py
 data/LICENSE
 data/
+wandb/latest-run/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
