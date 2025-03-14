@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torch_optimizer import Adafactor
-
+import pickle
 from poet.alphabets import Alphabet, Uniprot21
 from poet.models.poet import PoET
 import random 
@@ -20,7 +20,9 @@ IGNORE_INDEX = -100
 
 
 class ATCG(Alphabet):
-    """tokenize DNA sequence like this?"""
+    """
+    tokenize DNA sequence 
+    """
 
     def __init__(
         self,
@@ -53,7 +55,9 @@ class ATCG(Alphabet):
 
 
 class PromoterDataset(Dataset):
-    """Still need to figure out how each family is organized"""
+    """
+    Dataloader for promoter sets from Zoonomia
+    """
 
     def __init__(self, sequences: dict, queries: dict, alphabet, max_length):
         self.alphabet = alphabet
@@ -63,15 +67,101 @@ class PromoterDataset(Dataset):
         self.ids = list(sequences.keys())
         self.sampling_weights = [len(v) for k, v in self.sequences.items()]
         total = sum(self.sampling_weights)
-        self.sampling_weights = [ i / total for i in self.sampling_weights]
+        self.sampling_weights = [i/ total for i in self.sampling_weights]
         self.max_len = max_length
-        self.iters = 20
+        self.iters = len(self.ids) * 5
 
     def __getitem__(self, idx):
-        # randomly sample a gene with replacement, perhaps add weights here  
+        '''
+        randomly sample a gene with replacement
+        weighted by the number of sequences the gene has   
+        '''
         id = np.random.choice(self.ids, p = self.sampling_weights)
         sampled_set = self.sample_and_fit_sequences(id, weights = None, max_individual_seq_length=None, max_seq_length=self.max_len)
         return self.pack_inputs(sampled_set, self.alphabet, self.max_len)
+
+    def sample_query(self, id: str, p_human: float) -> str:
+        '''
+        sample a query sequence for a given gene, with a chosen probability of 
+        sampling a human sequence 
+        
+        Args:
+        id: gene name 
+        p_human: percent probability of sampling human 
+
+        Returns:
+        single sampled DNA sequence as a query
+        '''
+        human = np.random.choice([True, False], p=[p_human, 1 - p_human])
+        if human:
+            return self.queries[id]
+        else:
+            return np.random.choice(list(self.sequences[id]))
+        
+    
+    def diverse_sample_and_fit_sequences(
+        self,
+        query_id_or_sequence: Optional[str] = None,  # Changed parameter name to be more explicit
+        max_seq_length: int = 1024,
+        max_individual_seq_length: Optional[int] = None,
+        include_query: bool = True,
+        truncate: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        refer to docs in the next functions
+
+        greedy sampling strategy to maximize diversity within a subset based on hamming distance 
+        """
+
+
+        # Retrieve and possibly truncate the query
+        query_sequence = self.queries[query_id_or_sequence] # human sequence
+        
+        query_length = len(query_sequence) + self.num_special_characters if query_sequence else None
+        
+        # Calculate effective length for passages
+        effective_length = max_seq_length - (query_length if query_length is not None else 0)
+        
+        passages = []
+        passage_lengths = []
+        total_tokens = query_length if query_length is not None else 0
+        leftover = effective_length
+
+        sampled_ids = kdpp_select_diverse_seqs(list(self.sequences[query_id_or_sequence]), k=16)
+    
+        for seq in sampled_ids:
+            if not seq:
+                continue
+
+            seq_len = len(seq) + self.num_special_characters
+            if seq_len <= leftover:
+                passages.append(seq)
+                passage_lengths.append(seq_len)
+                leftover -= seq_len
+                total_tokens += seq_len
+            
+            elif truncate and leftover > 0:
+                # Truncate to fit remaining space
+                trunc_len = leftover - self.num_special_characters
+                seq = seq[:trunc_len]
+                passages.append(seq)
+                passage_lengths.append(leftover)
+                total_tokens += leftover
+                leftover = 0
+                break
+            
+            if leftover <= 0:
+                break       
+                                             
+        return {
+            "id": query_id_or_sequence if include_query else None,
+            "sequence": query_sequence,
+            "passages": passages,
+            "passage_lengths": passage_lengths,
+            "query_length": query_length,
+            "total_tokens": total_tokens
+        }
+        
 
     def sample_and_fit_sequences(
         self,
@@ -365,8 +455,13 @@ class PromoterDataset(Dataset):
     @staticmethod
     def train_validation_split(chr: int, sequences: dict, queries: dict) -> Tuple[Dict, Dict, Dict, Dict]:
         return sequences, queries, sequences, queries
+    
     @staticmethod
-    def _train_validation_split(chr: Union[int|str], sequences: dict, queries: dict) -> Tuple[Dict, Dict, Dict, Dict]:
+    def _train_validation_split(chr: int, sequences: dict, queries: dict) -> Tuple[Dict, Dict, Dict, Dict]:
+        """
+        splits two dictionaries based on the chromosome number of the keys
+
+        """
         train_seq = {}
         train_query = {}
         val_seq = {}
@@ -381,9 +476,11 @@ class PromoterDataset(Dataset):
             else:
                 train_seq[key] = sequences[key]
                 train_query[key] = queries[key]
+
+        print(f"training with {len(train_query)} sequences")
+        print(f"validating with {len(val_query)} sequences")
+
         return train_seq, train_query, val_seq, val_query   
-
-
 
 
 
@@ -398,8 +495,8 @@ def jit_warmup(embedding_model: PoET, alphabet: Uniprot21):
 
 
 class SqrtDecayScheduler(torch.optim.lr_scheduler._LRScheduler):
-    ''' they claim they use this in the paper,
-        couldn't find any info on this so this is fully AI-generated
+    ''' 
+    Used in original PoET Training
     '''
     def __init__(self, 
                  optimizer,
@@ -512,8 +609,8 @@ class PromoterModel(lightning.LightningModule):
         logits = logits[:, :-1, :].contiguous()  # Remove last logit
       
         loss = F.cross_entropy(
-            self._clamp(logits.view(-1, logits.size(-1))),
-            self._clamp(targets.view(-1)),
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
             ignore_index=IGNORE_INDEX,
             reduction='mean'
         )
@@ -527,7 +624,7 @@ class PromoterModel(lightning.LightningModule):
     def configure_optimizers(self):
         opt =  Adafactor(
             self.model.parameters(),
-            lr=1e-2,
+            lr=1e-4,
         )
         # scheduler = SqrtDecayScheduler(opt)
         return [opt]#, [scheduler]
@@ -541,8 +638,8 @@ class PromoterModel(lightning.LightningModule):
 
 
     def on_before_optimizer_step(self, optimizer):
-    # Compute the 2-norm for each layer
-    # If using mixed precision, the gradients are already unscaled here
+        # Compute the 2-norm for each layer
+        # If using mixed precision, the gradients are already unscaled here
         # norms = grad_norm(self.model.layer, norm_type=2)
         # print(norms)
         pass
@@ -550,21 +647,196 @@ class PromoterModel(lightning.LightningModule):
     def _clamp(self, x: torch.Tensor, minimum=0.0001) -> torch.Tensor:
         return x.clamp(min=torch.Tensor([minimum]).to(x.dtype).cuda())
 
+    
+def compute_similarity_matrix(strings):
+    """
+    Compute a similarity matrix from dissimilarity scores.
+    
+    Args:
+        strings: List of strings
+        dissimilarity_func: Function that takes two strings and returns a dissimilarity score
+    
+    Returns:
+        A similarity matrix (kernel matrix)
+    """
+
+    def hamming_distance(seq1, seq2):
+        """
+        Calculate the Hamming distance between two DNA sequences.
+        
+        Args:
+            seq1 (str): First DNA sequence
+            seq2 (str): Second DNA sequence
+            
+        Returns:
+            int: Hamming distance (number of differing positions)
+            
+        Raises:
+            ValueError: If sequences have different lengths
+        """
+        if len(seq1) != len(seq2):
+            raise ValueError("Sequences must have equal length")
+        
+        distance = 0
+        for i in range(len(seq1)):
+            if seq1[i] != seq2[i]:
+                distance += 1
+                
+        return distance 
+
+    n = len(strings)
+    # Initialize similarity matrix
+    L = np.zeros((n, n))
+    # Compute pairwise dissimilarities and convert to similarities
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                L[i, j] = 1.0  # Self-similarity is 1
+            else:
+                # Convert dissimilarity to similarity (higher dissimilarity = lower similarity)
+                dissimilarity = hamming_distance(strings[i], strings[j])
+                # Use RBF kernel to convert dissimilarity to similarity
+                L[i, j] = np.exp(-dissimilarity)
+    
+    return L
+
+def elementary_symmetric_polynomial(eigenvalues, k):
+    """
+    Compute elementary symmetric polynomials (e_k) using recursion.
+    
+    Args:
+        eigenvalues: Array of eigenvalues
+        k: Size of the subset
+    
+    Returns:
+        Array of e_0, e_1, ..., e_k
+    """
+    n = len(eigenvalues)
+    E = np.zeros((k + 1, n + 1))
+    E[0, :] = 1
+    
+    for l in range(1, k + 1):
+        for n_idx in range(1, n + 1):
+            E[l, n_idx] = E[l, n_idx - 1] + eigenvalues[n_idx - 1] * E[l - 1, n_idx - 1]
+    
+    return E[:, n]
+
+def sample_kdpp(L, k):
+    """
+    Sample a subset of size k using k-DPP.
+    
+    Args:
+        L: Similarity matrix (kernel matrix)
+        k: Size of the subset to sample
+        
+    Returns:
+        List of indices representing the sampled subset
+    """
+    n = L.shape[0]
+    
+    # Compute eigendecomposition of L
+    eigenvalues, eigenvectors = np.linalg.eigh(L)
+    # Sort eigenvalues in descending order
+    idx = np.argsort(eigenvalues)[::-1]
+    eigenvalues = eigenvalues[idx]
+    eigenvectors = eigenvectors[:, idx]
+    
+    # Compute elementary symmetric polynomials
+    E = elementary_symmetric_polynomial(eigenvalues, k)
+    
+    # Phase 1: Select k eigenvectors
+    selected_indices = []
+    remaining = list(range(n))
+    
+    for i in range(k, 0, -1):
+        # Compute probabilities
+        probs = np.zeros(len(remaining))
+        for j, idx in enumerate(remaining):
+            probs[j] = eigenvalues[idx] * E[i-1][idx] / E[i][idx]
+  
+        # Normalize probabilities
+        probs = probs / np.sum(probs)
+        
+        # Sample index
+        j = np.random.choice(len(remaining), p=probs)
+        selected_indices.append(remaining[j])
+        remaining.pop(j)
+    
+    # Phase 2: Convert from eigenvector indices to item indices
+    V = eigenvectors[:, selected_indices]
+    
+    # Orthonormalize V
+    Y = np.zeros((n, k))
+    for i in range(k):
+        Y[:, i] = V[:, i]
+        for j in range(i):
+            Y[:, i] = Y[:, i] - np.dot(Y[:, i], Y[:, j]) * Y[:, j]
+        Y[:, i] = Y[:, i] / np.linalg.norm(Y[:, i])
+    
+    # Sample items
+    selected_set = set()
+    remaining_items = list(range(n))
+    
+    for i in range(k, 0, -1):
+        # Compute probabilities
+        probs = np.zeros(len(remaining_items))
+        for j, idx in enumerate(remaining_items):
+            probs[j] = np.sum(Y[idx, :i]**2)
+        
+        # Normalize probabilities
+        probs = probs / np.sum(probs)
+        
+        # Sample item
+        j = np.random.choice(len(remaining_items), p=probs)
+        selected_set.add(remaining_items[j])
+        
+        # Update Y
+        e_j = Y[remaining_items[j], :i] / np.linalg.norm(Y[remaining_items[j], :i])
+        Y_new = np.zeros((n, i-1))
+        
+        for l in range(n):
+            for m in range(i-1):
+                Y_new[l, m] = Y[l, m] - e_j[m] * Y[l, i-1]
+        
+        Y = Y_new
+        remaining_items.pop(j)
+    
+    return list(selected_set)
+
+def kdpp_select_diverse_seqs(sequences, k):
+    """
+    Select a diverse subset of sequences using k-DPP.
+    
+    Args:
+        strings: List of strings
+        dissimilarity_func: Function that takes two strings and returns a dissimilarity score
+        k: Size of the subset to select
+        
+    Returns:
+        List of selected strings
+    """
+    # Compute similarity matrix
+    L = compute_similarity_matrix(sequences)
+    # Sample subset
+    selected_indices = sample_kdpp(L, k)
+    # Return selected strings
+    return [sequences[i] for i in selected_indices]
+
 def main():
     parser = argparse.ArgumentParser(description="Train a PromoterModel")
     parser.add_argument(
-        "--batch_size", type=int, default=2, help="Batch size for training"
+        "--batch_size", type=int, default=4, help="Batch size for training"
     )
     parser.add_argument(
-        "--num_epochs", type=int, default=6, help="Number of training epochs"
+        "--num_epochs", type=int, default=10, help="Number of training epochs"
     )
     parser.add_argument(
-        "--max_len", type=int, default=2000, help="Maximum sequence length"
+        "--max_len", type=int, default=16000, help="Maximum sequence length"
     )
     parser.add_argument(
         "--initial_learning_rate",
         type=float,
-        default=1e-12,
+        default=1e-2,
         help="Initial learning rate",
     )
     parser.add_argument(
@@ -604,8 +876,14 @@ def main():
     'BSKUP': 'TCGACGAATG',
     }
 
+    with open("data/hits.pkl", "rb") as f:
+        h = pickle.load(f)
+    with open("data/query.pkl", "rb") as f:
+        q = pickle.load(f)
     # TODO: train, validation split into four dictionaries
-    example, example_query, val_example, val_query = PromoterDataset.train_validation_split( chr= 19, sequences=example, queries=example_query)
+    # example, example_query, val_example, val_query = PromoterDataset.train_validation_split( chr= 19, sequences=example, queries=example_query)
+
+    train_seq, train_query, val_seq, val_query  = PromoterDataset._train_validation_split(19, h, q)
 
 
     alphabet = ATCG(
@@ -617,8 +895,8 @@ def main():
     model.initialize_model()
 
     logger = WandbLogger(project = "poet")
-    train_dataset = PromoterDataset(example, example_query, alphabet, args.max_len)
-    val_dataset = PromoterDataset(val_example, val_query, alphabet, args.max_len)
+    train_dataset = PromoterDataset(train_seq, train_query, alphabet, args.max_len)
+    val_dataset = PromoterDataset(val_seq, val_query, alphabet, args.max_len)
 
     train_loader = DataLoader(
         train_dataset,
@@ -638,13 +916,16 @@ def main():
         max_epochs=args.num_epochs,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         # accelerator="cpu",
-        devices="auto",
+        # devices="auto",
         logger=logger,
         detect_anomaly=True,
         log_every_n_steps=10,
-        precision="bf16"
+        precision="bf16",
         # gradient_clip_val=0.5,
         # gradient_clip_algorithm="value"
+        strategy="ddp",
+        devices=1,
+        val_check_interval=0.5
     )
     # uniprot = Uniprot21()
     # jit_warmup(model, uniprot)
@@ -653,6 +934,7 @@ def main():
         train_dataloaders=train_loader,
         val_dataloaders= val_loader,
     )
+    trainer.save_checkpoint("first_pass.ckpt")
    
 
 if __name__ == "__main__":

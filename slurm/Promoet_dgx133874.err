@@ -1,0 +1,8 @@
+
+The following have been reloaded with a version change:
+  1) gcc/13.1.0 => gcc/13.2.0
+
+  File "/n/lw_groups/hms/sysbio/marks/lab/jix836/Promoter_Poet_private/scripts/train.py", line 647
+    trainer = lightning.Trainer(
+        ^
+SyntaxError: keyword argument repeated: devices
