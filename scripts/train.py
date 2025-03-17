@@ -77,8 +77,8 @@ class PromoterDataset(Dataset):
         weighted by the number of sequences the gene has   
         '''
         id = np.random.choice(self.ids, p = self.sampling_weights)
-        sampled_set = self.sample_and_fit_sequences(id, weights = None, max_individual_seq_length=None, max_seq_length=self.max_len)
-        # sampled_set = self.diverse_sample_and_fit_sequences(id)
+        # sampled_set = self.sample_and_fit_sequences(id, weights = None, max_individual_seq_length=None, max_seq_length=self.max_len)
+        sampled_set = self.diverse_sample_and_fit_sequences(id)
         return self.pack_inputs(sampled_set, self.alphabet, self.max_len)
 
     def sample_query(self, id: str, p_human: float) -> str:
@@ -111,11 +111,11 @@ class PromoterDataset(Dataset):
         """
         refer to docs in the next functions
 
-        greedy sampling strategy to maximize diversity within a subset based on hamming distance 
+        uses k-DPP sampling strategy to maximize diversity within a subset based on hamming distance 
         """
 
         # Retrieve and possibly truncate the query
-        query_sequence = self.sample_query(query_id_or_sequence, 0.3) # human sequence
+        query_sequence = self.sample_query(query_id_or_sequence, 0.3) # P(human sequence) = 0.3
         
         query_length = len(query_sequence) + self.num_special_characters if query_sequence else None
         
@@ -127,7 +127,7 @@ class PromoterDataset(Dataset):
         total_tokens = query_length if query_length is not None else 0
         leftover = effective_length
 
-        sampled_ids = kdpp_select_diverse_seqs(self.sequences[query_id_or_sequence], k=16)
+        sampled_ids = kdpp_select_diverse_seqs(self.sequences[query_id_or_sequence], k=2)
     
         for seq in sampled_ids:
             if not seq:
@@ -152,7 +152,7 @@ class PromoterDataset(Dataset):
             
             if leftover <= 0:
                 break       
-                                             
+        # print(passages)                                     
         return {
             "id": query_id_or_sequence if include_query else None,
             "sequence": query_sequence,
@@ -752,7 +752,9 @@ def sample_kdpp(L, k):
         # Compute probabilities
         probs = np.zeros(len(remaining))
         for j, idx in enumerate(remaining):
-            probs[j] = eigenvalues[idx] * E[i-1][idx] / E[i][idx]
+            # print(E.shape, eigenvalues.shape, probs.shape)
+            # breakpoint()
+            probs[j] = eigenvalues[idx] * E[i-1] / E[i]
   
         # Normalize probabilities
         probs = probs / np.sum(probs)
@@ -831,7 +833,7 @@ def main():
         "--num_epochs", type=int, default=10, help="Number of training epochs"
     )
     parser.add_argument(
-        "--max_len", type=int, default=16000, help="Maximum sequence length"
+        "--max_len", type=int, default=1000, help="Maximum sequence length"
     )
     parser.add_argument(
         "--initial_learning_rate",
@@ -847,13 +849,13 @@ def main():
     )
     args = parser.parse_args()
 
-    example =  {
+    h =  {
     'OXKSZ': {'ACAGAGTAACTGC', 'CACGCAAGCGACTA', 'GGGCGGGTAGTACCC'},
     'GHXGF': {'AAAATGGTCTGTC', 'AATAAGTGAG', 'CGCGACGCCATAGTT'},
     'XSVNO': {'CCGATCCCGCCCGC', 'GCGGGCCGGCATGCC', 'TTTAGTTGTGTT'},
     'LPTSW': {'ATTGCTGGACA', 'GCAGTGCCAGTTTC', 'GTCATCGTGCACAT'},
     'SAPJM': {'AGAGGTACCC', 'CGGGTGAAATT', 'CTGGTCACGAGTT'},
-    'KNGBV': {'AGCACGCACG'},
+    'KNGBV': {'AGCACGCACG', 'GAGCGTATCGCAGC'},
     'YTWYS': {'AATGCAACTGGTT', 'ATGAAATTATT', 'GTACAGACCC'},
     'IMXVE': {'TAGTGCAACC', 'TGAGACGGACGAT',},
     'QDKFG': {'CAGGTTTGGCCTGT', 'CCCAGTTACCA', 'GTTTGACTGC'},
@@ -861,7 +863,7 @@ def main():
     'XQIRL': {'CACGTGGCGCCGCTT', 'CCGTTTTATTG', 'GTCCTTACATGCCCC'},
     'BSKUP': {'GAGCCTCTTGCG', 'GAGCGTATCGCAGC'},
     }
-    example_query =  {
+    q =  {
     'OXKSZ': 'ACAGAGTAACTGC' ,
     'GHXGF': 'AAAATGGTCTGTC',
     'XSVNO': 'CCGATCCCGCCCGC',
@@ -876,14 +878,15 @@ def main():
     'BSKUP': 'TCGACGAATG',
     }
 
-    with open("data/hits.pkl", "rb") as f:
-        h = pickle.load(f)
-    with open("data/query.pkl", "rb") as f:
-        q = pickle.load(f)
-    # TODO: train, validation split into four dictionaries
+    # with open("data/hits.pkl", "rb") as f:
+    #     h = pickle.load(f)
+    # with open("data/query.pkl", "rb") as f:
+    #     q = pickle.load(f)
+
     # example, example_query, val_example, val_query = PromoterDataset.train_validation_split( chr= 19, sequences=example, queries=example_query)
 
-    train_seq, train_query, val_seq, val_query  = PromoterDataset._train_validation_split(19, h, q)
+    # train_seq, train_query, val_seq, val_query  = PromoterDataset._train_validation_split(19, h, q)
+    train_seq, train_query, val_seq, val_query  = PromoterDataset.train_validation_split(19, h, q)
 
 
     alphabet = ATCG(
@@ -923,7 +926,7 @@ def main():
         precision="bf16",
         # gradient_clip_val=0.5,
         # gradient_clip_algorithm="value"
-        strategy="ddp",
+        # strategy="ddp",
         devices=1,
         val_check_interval=0.5
     )

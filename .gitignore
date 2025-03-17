@@ -30,6 +30,7 @@ share/python-wheels/
 *.egg-info/
 wandb
 wandb/
+slurm/
 lightning_logs/
 .installed.cfg
 *.egg
