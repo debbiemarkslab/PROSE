@@ -17,6 +17,11 @@ from poet.models.modules.packed_sequence import PackedTensorSequences
 from poet.models.poet import PoET
 from poet.msa.sampling import MSASampler, NeighborsSampler
 
+import pickle
+from train import PromoterModel, ATCG, PromoterDataset
+from poet.alphabets import Alphabet, Uniprot21
+from poet.models.poet import PoET
+
 ASCII_LOWERCASE_BYTES = string.ascii_lowercase.encode()
 PBAR_POSITION = 1
 
@@ -50,12 +55,11 @@ def get_seqs_from_fastalike(filepath: Path) -> list[bytes]:
 def get_encoded_msa_from_a3m_seqs(
     msa_sequences: list[bytes], alphabet: Uniprot21
 ) -> np.ndarray:
-    return np.vstack(
-        [
-            alphabet.encode(s.translate(None, delete=ASCII_LOWERCASE_BYTES))
+    return [
+            alphabet.encode(s.encode('utf-8').translate(None, delete=ASCII_LOWERCASE_BYTES))
             for s in msa_sequences
         ]
-    )
+    
 
 
 def sample_msa_sequences(
@@ -167,16 +171,11 @@ def get_logps_tiered_fast(
     alphabet: Uniprot21,
     pbar_position: Optional[int] = None,
 ) -> np.ndarray:
-    # print("SHAPES: ",  len(msa_sequences), msa_sequences[0].shape, len(variants),
-    #       variants[0].shape)
-    # breakpoint()
     if len(msa_sequences) > 0:
         segment_sizes = torch.tensor([len(s) for s in msa_sequences]).cuda()
         msa_sequences: torch.Tensor = torch.cat(
             [torch.from_numpy(s).long() for s in msa_sequences]
         ).cuda()
-        print(msa_sequences.shape)
-        breakpoint()
         memory = model.embed(
             msa_sequences.unsqueeze(0),
             segment_sizes.unsqueeze(0),
@@ -198,30 +197,28 @@ def get_logps_tiered_fast(
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt_path", type=str, default="data/poet.ckpt")
+
     parser.add_argument(
-        "--msa_a3m_path", type=str, default="data/BLAT_ECOLX_ColabFold_2202.a3m"
-    )
-    parser.add_argument(
-        "--variants_fasta_path",
+        "--variants_path",
         type=str,
         default="data/BLAT_ECOLX_Jacquier_2013_variants.fasta",
     )
+
     parser.add_argument(
         "--output_npy_path",
         type=str,
-        default="data/BLAT_ECOLX_Jacquier_2013_variants.npy",
+        default="data/scored_variants.npy",
     )
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=188257)
+ 
     parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="run only 1/15 params from the msa sampling and filtering ensemble",
+        "--hits_path",
+        type = str,
+        default="data/hits.pkl"
     )
-
+    
     args = parser.parse_args()
-    args.msa_a3m_path = Path(args.msa_a3m_path)
-    args.variants_fasta_path = Path(args.variants_fasta_path)
     args.output_npy_path = Path(args.output_npy_path)
     return args
 
@@ -230,82 +227,84 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # load model
-    ckpt = torch.load(args.ckpt_path)
-    model = PoET(**ckpt["hyper_parameters"]["model_spec"]["init_args"])
-    model.load_state_dict(
-        {k.split(".", 1)[1]: v for k, v in ckpt["state_dict"].items()}
-    )
-    del ckpt
-    model = model.cuda().half().eval()
-    alphabet = Uniprot21(
-        include_gap=True, include_startstop=True, distinct_startstop=True
-    )
-    jit_warmup(model, alphabet)
+    model = PromoterModel()
+    model.load_from_checkpoint(args.ckpt_path)
+    model = model.model
 
+    alphabet = ATCG()
+
+    model = model.cuda().eval()
+    # with open(args.hits_path, "rb") as f:
+    #     hits = pickle.load(f)
+    # with open(args.variants_path, "rb") as f:
+    #     variants = pickle.load(f)
+    hits =  {
+    'OXKSZ': {'ACAGAGTAACTGC', 'CACGCAAGCGACTA', 'GGGCGGGTAGTACCC'},
+    'GHXGF': {'AAAATGGTCTGTC', 'AATAAGTGAG', 'CGCGACGCCATAGTT'},
+    'XSVNO': {'CCGATCCCGCCCGC', 'GCGGGCCGGCATGCC', 'TTTAGTTGTGTT'},
+    'LPTSW': {'ATTGCTGGACA', 'GCAGTGCCAGTTTC', 'GTCATCGTGCACAT'},
+    'SAPJM': {'AGAGGTACCC', 'CGGGTGAAATT', 'CTGGTCACGAGTT'},
+    'KNGBV': {'AGCACGCACG', 'GAGCGTATCGCAGC'},
+    'YTWYS': {'AATGCAACTGGTT', 'ATGAAATTATT', 'GTACAGACCC'},
+    'IMXVE': {'TAGTGCAACC', 'TGAGACGGACGAT',},
+    'QDKFG': {'CAGGTTTGGCCTGT', 'CCCAGTTACCA', 'GTTTGACTGC'},
+    'GDLYH': {'AACGACAAGCATG', 'TACCCGAGTGTAT', 'TGGGATCTCA'},
+    'XQIRL': {'CACGTGGCGCCGCTT', 'CCGTTTTATTG', 'GTCCTTACATGCCCC'},
+    'BSKUP': {'GAGCCTCTTGCG', 'GAGCGTATCGCAGC'},
+    }
+    variants =  {
+    'OXKSZ': 'ACAGAGTAACTGC' ,
+    'GHXGF': 'AAAATGGTCTGTC',
+    'XSVNO': 'CCGATCCCGCCCGC',
+    'LPTSW': 'ATTGCTGGACA',
+    'SAPJM': 'CTGGTCACGAGTT',
+    'KNGBV': 'CGGGTAGTTGCGAAC',
+    'YTWYS': 'GTACAGACCC',
+    'IMXVE': 'TAGTGCAACC',
+    'QDKFG': 'GTTTGACTGC',
+    'GDLYH': 'TGGGATCTCA',
+    'XQIRL': 'GTCCTTACATGCCCC',
+    'BSKUP': 'TCGACGAATG',
+    }
+    dataset = PromoterDataset(hits, variants, alphabet, max_length = 1200 )
+    
     # get variants to score
-    variants = [
-        append_startstop(alphabet.encode(v), alphabet=alphabet)
-        for v in get_seqs_from_fastalike(args.variants_fasta_path)
+    
+    msa_sequences = [
+        np.array(dataset.get_inference_seqs(v, id)) for id, v in variants.items()
     ]
-
-    # process msa
-    msa_sequences = get_seqs_from_fastalike(args.msa_a3m_path)
-    msa = get_encoded_msa_from_a3m_seqs(msa_sequences=msa_sequences, alphabet=alphabet)
+    # print("a", msa_sequences)
+    # breakpoint()
+    variants = [
+        append_startstop(alphabet.encode(v.encode('utf-8')), alphabet=alphabet)
+        for v in variants.values()
+    ]
 
     # score the variants
     logps = []
-    if not args.debug:
-        params = list(
-            itertools.product(
-                [6144, 12288, 24576],
-                [1.0, 0.95, 0.90, 0.70, 0.50],
-            )
-        )
-    else:
-        params = [(12288, 0.95)]
-    for max_tokens, max_similarity in tqdm(params, desc="ensemble"):
-        sampler = MSASampler(
-            method=NeighborsSampler(
-                can_use_torch=False,
-            ),
-            max_similarity=max_similarity,
-        )
-        sample_idxs = sampler.get_sample_idxs(
-            msa=msa,
-            gap_token=alphabet.gap_token,
-            seed=args.seed,
-        )
-        # create the sequence-of-sequences
-        this_msa_sequences = sample_msa_sequences(
-            get_sequence_fn=lambda ii: msa_sequences[ii]
-            .upper()
-            .translate(None, delete=b"-"),
-            sample_idxs=sample_idxs,
-            max_tokens=max_tokens,
-            alphabet=alphabet,
-            shuffle_seed=args.seed,
-            truncate=False,
-        )
+
+    for i, var in tqdm(enumerate(variants)):
+        msa = msa_sequences[i]
+        msa = get_encoded_msa_from_a3m_seqs(msa_sequences=msa, alphabet=alphabet)
         forward_logps = get_logps_tiered_fast(
-            msa_sequences=this_msa_sequences,
-            variants=variants,
+            msa_sequences=msa,
+            variants=[np.ascontiguousarray([var])],
             model=model,
             batch_size=args.batch_size,
             alphabet=alphabet,
             pbar_position=PBAR_POSITION,
         )
         backward_logps = get_logps_tiered_fast(
-            msa_sequences=[np.ascontiguousarray(s[::-1]) for s in this_msa_sequences],
-            variants=[np.ascontiguousarray(s[::-1]) for s in variants],
+            msa_sequences=[np.ascontiguousarray(s[::-1]) for s in msa],
+            variants=[np.ascontiguousarray(var[::-1])],
             model=model,
             batch_size=args.batch_size,
             alphabet=alphabet,
             pbar_position=PBAR_POSITION,
         )
-        this_logps = (forward_logps + backward_logps) / 2
-        logps.append(this_logps)
-    logps = np.vstack(logps).mean(axis=0)
+        curr_logps = (forward_logps + backward_logps) / 2
+        logps.append(curr_logps)
+    # logps = np.vstack(logps).mean(axis=0)
     np.save(args.output_npy_path, logps)
 
 

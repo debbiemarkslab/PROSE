@@ -78,8 +78,13 @@ class PromoterDataset(Dataset):
         '''
         id = np.random.choice(self.ids, p = self.sampling_weights)
         # sampled_set = self.sample_and_fit_sequences(id, weights = None, max_individual_seq_length=None, max_seq_length=self.max_len)
-        sampled_set = self.diverse_sample_and_fit_sequences(id)
+        sampled_set = self.diverse_sample_and_fit_sequences(id, max_seq_length=self.max_len)
         return self.pack_inputs(sampled_set, self.alphabet, self.max_len)
+
+    def get_inference_seqs(self, variant: str,id: str):
+        sampled_set = self.diverse_sample_and_fit_sequences(id)
+        
+        return sampled_set["passages"]
 
     def sample_query(self, id: str, p_human: float) -> str:
         '''
@@ -107,16 +112,20 @@ class PromoterDataset(Dataset):
         max_individual_seq_length: Optional[int] = None,
         include_query: bool = True,
         truncate: bool = False,
+        p_human: float = 0.3,
+
     ) -> Dict[str, Any]:
         """
-        refer to docs in the next functions
+        refer to docs of sample_and_fit_sequences
 
-        uses k-DPP sampling strategy to maximize diversity within a subset based on hamming distance 
+        uses k-DPP sampling to maximize diversity within a subset based on hamming distance 
         """
+        if query_id_or_sequence is None:
 
-        # Retrieve and possibly truncate the query
-        query_sequence = self.sample_query(query_id_or_sequence, 0.3) # P(human sequence) = 0.3
-        
+            query_sequence = self.sample_query(query_id_or_sequence, p_human) # P(human sequence) = 0.3
+        else:
+            query_sequence  = query_id_or_sequence
+
         query_length = len(query_sequence) + self.num_special_characters if query_sequence else None
         
         # Calculate effective length for passages
@@ -127,7 +136,10 @@ class PromoterDataset(Dataset):
         total_tokens = query_length if query_length is not None else 0
         leftover = effective_length
 
-        sampled_ids = kdpp_select_diverse_seqs(self.sequences[query_id_or_sequence], k=2)
+        # sample enough sequences to meet the max length if possible 
+        K = min(len(self.sequences[query_id_or_sequence]),effective_length // 1000 + 1)
+
+        sampled_ids = kdpp_select_diverse_seqs(self.sequences[query_id_or_sequence], k= K)
     
         for seq in sampled_ids:
             if not seq:
@@ -152,7 +164,8 @@ class PromoterDataset(Dataset):
             
             if leftover <= 0:
                 break       
-        # print(passages)                                     
+        # print(passages)   
+        #                                  
         return {
             "id": query_id_or_sequence if include_query else None,
             "sequence": query_sequence,
