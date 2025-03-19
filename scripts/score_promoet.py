@@ -2,7 +2,7 @@ import argparse
 import itertools
 import string
 from pathlib import Path
-from typing import Callable, Optional, Sequence, TypeVar
+from typing import Callable, Optional, Sequence, TypeVar, List
 
 import numpy as np
 import torch
@@ -54,9 +54,11 @@ def get_seqs_from_fastalike(filepath: Path) -> list[bytes]:
 
 def get_encoded_msa_from_a3m_seqs(
     msa_sequences: list[bytes], alphabet: Uniprot21
-) -> np.ndarray:
+) -> List:
     return [
-            alphabet.encode(s.encode('utf-8').translate(None, delete=ASCII_LOWERCASE_BYTES))
+            append_startstop(alphabet.encode(s.encode('utf-8')
+                                             .translate(None, delete=ASCII_LOWERCASE_BYTES)), 
+                                             alphabet)
             for s in msa_sequences
         ]
     
@@ -178,6 +180,8 @@ def get_logps_tiered_fast(
         msa_sequences: torch.Tensor = torch.cat(
             [torch.from_numpy(s).long() for s in msa_sequences]
         ).cuda()
+        # print(msa_sequences.shape)
+        # breakpoint()
         memory = model.embed(
             msa_sequences.unsqueeze(0),
             segment_sizes.unsqueeze(0),
@@ -287,7 +291,10 @@ def main():
 
     for i, var in tqdm(enumerate(variants)):
         msa = msa_sequences[i]
+        # wt = wt_seqs[i]
+        # breakpoint()
         msa = get_encoded_msa_from_a3m_seqs(msa_sequences=msa, alphabet=alphabet)
+        
         forward_logps = get_logps_tiered_fast(
             msa_sequences=msa,
             variants=[np.ascontiguousarray([var])],
@@ -306,6 +313,7 @@ def main():
         )
         curr_logps = (forward_logps + backward_logps) / 2
         logps.append(curr_logps)
+        print(curr_logps)
     # logps = np.vstack(logps).mean(axis=0)
     np.save(args.output_npy_path, logps)
 
