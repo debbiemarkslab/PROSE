@@ -138,6 +138,8 @@ def _get_logps_tiered_fast(
     else:
         pbar = range(0, len(variants), batch_size)
     for start_idx in pbar:
+        print(variants.shape)
+        breakpoint()
         this_variants = variants[start_idx : start_idx + batch_size]
         this_variants = pad_sequence(
             [torch.from_numpy(v).long() for v in this_variants],
@@ -152,6 +154,7 @@ def _get_logps_tiered_fast(
             )
         assert (this_variants == alphabet.gap_token).sum() == 0
         this_variants = this_variants.cuda()
+        
         logits = model.logits(this_variants[:, :-1], memory, preallocated_memory=True)
         targets = this_variants[:, 1:]
         score = -criteria.forward(logits.transpose(1, 2), targets).float().sum(dim=1)
