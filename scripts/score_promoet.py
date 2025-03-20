@@ -15,7 +15,6 @@ from poet.alphabets import Uniprot21
 from poet.fasta import parse_stream
 from poet.models.modules.packed_sequence import PackedTensorSequences
 from poet.models.poet import PoET
-from poet.msa.sampling import MSASampler, NeighborsSampler
 
 import pickle
 from train import PromoterModel, ATCG, PromoterDataset
@@ -180,8 +179,7 @@ def get_logps_tiered_fast(
         msa_sequences: torch.Tensor = torch.cat(
             [torch.from_numpy(s).long() for s in msa_sequences]
         ).cuda()
-        # print(msa_sequences.shape)
-        # breakpoint()
+      
         memory = model.embed(
             msa_sequences.unsqueeze(0),
             segment_sizes.unsqueeze(0),
@@ -202,27 +200,29 @@ def get_logps_tiered_fast(
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt_path", type=str, 
-                        default="/n/lw_groups/hms/sysbio/marks/lab/jix836/Promoter_Poet_private/human_query_random_subset_200k.ckpt")
+    parser.add_argument("--ckpt_path", 
+                        type=str, 
+                        default="human_query_random_subset_200k.ckpt")
 
-    parser.add_argument(
-        "--variants_path",
-        type=str,
-        default="data/indels.csv",
+    parser.add_argument("--variants_path",
+                        type=str,
+                        default="data/indels.csv",
     )
 
-    parser.add_argument(
-        "--output_npy_path",
-        type=str,
-        default="data/scored_variants.npy",
+    parser.add_argument("--output_npy_path",
+                        type=str,
+                        default="data/scored_variants.npy",
     )
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=188257)
+    parser.add_argument("--batch_size", 
+                        type=int, 
+                        default=4)
+    parser.add_argument("--seed", 
+                        type=int, 
+                        default=188257)
  
-    parser.add_argument(
-        "--hits_path",
-        type = str,
-        default="data/hits.pkl"
+    parser.add_argument("--hits_path",
+                        type = str,
+                        default="data/hits.pkl"
     )
     
     args = parser.parse_args()
@@ -240,56 +240,25 @@ def main():
     variants = variants_df["VAR"].to_numpy()
     names = variants_df["GENE"] + "_" + variants_df["CHROM"]
 
+    with open(args.hits_path, "rb") as f:
+        hits = pickle.load(f)
+
+    dataset = PromoterDataset(hits, {}, alphabet, max_length = 6000 )
+
     print("-------loading model--------")
 
     model = PromoterModel()
     model.load_from_checkpoint(args.ckpt_path)
     model = model.model
-
     alphabet = ATCG()
-
     model = model.cuda().eval()
-    with open(args.hits_path, "rb") as f:
-        hits = pickle.load(f)
-    # print(hits.keys())
-    # breakpoint()
-    # hits =  {
-    # 'OXKSZ': {'ACAGAGTAACTGC', 'CACGCAAGCGACTA', 'GGGCGGGTAGTACCC'},
-    # 'GHXGF': {'AAAATGGTCTGTC', 'AATAAGTGAG', 'CGCGACGCCATAGTT'},
-    # 'XSVNO': {'CCGATCCCGCCCGC', 'GCGGGCCGGCATGCC', 'TTTAGTTGTGTT'},
-    # 'LPTSW': {'ATTGCTGGACA', 'GCAGTGCCAGTTTC', 'GTCATCGTGCACAT'},
-    # 'SAPJM': {'AGAGGTACCC', 'CGGGTGAAATT', 'CTGGTCACGAGTT'},
-    # 'KNGBV': {'AGCACGCACG', 'GAGCGTATCGCAGC'},
-    # 'YTWYS': {'AATGCAACTGGTT', 'ATGAAATTATT', 'GTACAGACCC'},
-    # 'IMXVE': {'TAGTGCAACC', 'TGAGACGGACGAT',},
-    # 'QDKFG': {'CAGGTTTGGCCTGT', 'CCCAGTTACCA', 'GTTTGACTGC'},
-    # 'GDLYH': {'AACGACAAGCATG', 'TACCCGAGTGTAT', 'TGGGATCTCA'},
-    # 'XQIRL': {'CACGTGGCGCCGCTT', 'CCGTTTTATTG', 'GTCCTTACATGCCCC'},
-    # 'BSKUP': {'GAGCCTCTTGCG', 'GAGCGTATCGCAGC'},
-    # }
-    # variants =  {
-    # 'OXKSZ': 'ACAGAGTAACTGC' ,
-    # 'GHXGF': 'AAAATGGTCTGTC',
-    # 'XSVNO': 'CCGATCCCGCCCGC',
-    # 'LPTSW': 'ATTGCTGGACA',
-    # 'SAPJM': 'CTGGTCACGAGTT',
-    # 'KNGBV': 'CGGGTAGTTGCGAAC',
-    # 'YTWYS': 'GTACAGACCC',
-    # 'IMXVE': 'TAGTGCAACC',
-    # 'QDKFG': 'GTTTGACTGC',
-    # 'GDLYH': 'TGGGATCTCA',
-    # 'XQIRL': 'GTCCTTACATGCCCC',
-    # 'BSKUP': 'TCGACGAATG',
-    # }
-    dataset = PromoterDataset(hits, {}, alphabet, max_length = 6000 )
     
-    # get variants to score
+    # get homologs to score
     print("-------generating prompt--------")
     msa_sequences = [
         np.array(dataset.get_inference_seqs(v, id)) for (id, v) in zip(names, variants)
     ]
-    # print("a", msa_sequences)
-    # breakpoint()
+    
     variants = variants = [
         append_startstop(alphabet.encode(v.encode('utf-8')), alphabet=alphabet)
         for v in variants
@@ -304,14 +273,13 @@ def main():
     logps = []
     print("-------scoring variants--------")
     for i, (w ,var) in tqdm(enumerate(zip(wt, variants)), total=len(wt)):
+
         msa = msa_sequences[i]
-        # wt = wt_seqs[i]
-        # breakpoint()
         msa = get_encoded_msa_from_a3m_seqs(msa_sequences=msa, alphabet=alphabet)
         
         forward_logps = get_logps_tiered_fast(
             msa_sequences=msa,
-            variants=[np.ascontiguousarray([var, w])],
+            variants=[np.ascontiguousarray([var])],
             model=model,
             batch_size=args.batch_size,
             alphabet=alphabet,
@@ -319,19 +287,36 @@ def main():
         )
         backward_logps = get_logps_tiered_fast(
             msa_sequences=[np.ascontiguousarray(s[::-1]) for s in msa],
-            variants=[np.ascontiguousarray(var[::-1]), np.ascontiguousarray(w[::-1])],
+            variants=[np.ascontiguousarray(var[::-1])],
             model=model,
             batch_size=args.batch_size,
             alphabet=alphabet,
             pbar_position=PBAR_POSITION,
         )
-        curr_logps = (forward_logps + backward_logps) / 2
+
+        wt_forward_logps = get_logps_tiered_fast(
+            msa_sequences=msa,
+            variants=[np.ascontiguousarray([w])],
+            model=model,
+            batch_size=args.batch_size,
+            alphabet=alphabet,
+            pbar_position=PBAR_POSITION,
+        )
+
+        wt_backward_logps = get_logps_tiered_fast(
+            msa_sequences=[np.ascontiguousarray(s[::-1]) for s in msa],
+            variants=[np.ascontiguousarray(w[::-1])],
+            model=model,
+            batch_size=args.batch_size,
+            alphabet=alphabet,
+            pbar_position=PBAR_POSITION,
+        )
+
+        curr_logps = (forward_logps + backward_logps - wt_forward_logps - wt_backward_logps) / 2
 
         logps.append(curr_logps)
-        # print(curr_logps)
-    # logps = np.vstack(logps).mean(axis=0)
-    logps = np.array(logps)
-    print(logps.shape)
+
+    print("-------saving output--------")
     np.save(args.output_npy_path, logps)
 
 if __name__ == "__main__":
