@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm, trange
-
+import pandas as pd
 from poet.alphabets import Uniprot21
 from poet.fasta import parse_stream
 from poet.models.modules.packed_sequence import PackedTensorSequences
@@ -202,12 +202,13 @@ def get_logps_tiered_fast(
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt_path", type=str, default="data/poet.ckpt")
+    parser.add_argument("--ckpt_path", type=str, 
+                        default="/n/lw_groups/hms/sysbio/marks/lab/jix836/Promoter_Poet_private/human_query_random_subset_200k.ckpt")
 
     parser.add_argument(
         "--variants_path",
         type=str,
-        default="data/BLAT_ECOLX_Jacquier_2013_variants.fasta",
+        default="data/indels.csv",
     )
 
     parser.add_argument(
@@ -232,6 +233,14 @@ def parse_args():
 @torch.inference_mode()
 def main():
     args = parse_args()
+    print("-------loading data--------")
+
+    variants_df = pd.read_csv(args.variants_path)
+    wt = variants_df["WT"].to_numpy()
+    variants = variants_df["VAR"].to_numpy()
+    names = variants_df["GENE"] + "_" + variants_df["CHROM"]
+
+    print("-------loading model--------")
 
     model = PromoterModel()
     model.load_from_checkpoint(args.ckpt_path)
@@ -240,56 +249,61 @@ def main():
     alphabet = ATCG()
 
     model = model.cuda().eval()
-    # with open(args.hits_path, "rb") as f:
-    #     hits = pickle.load(f)
-    # with open(args.variants_path, "rb") as f:
-    #     variants = pickle.load(f)
-    hits =  {
-    'OXKSZ': {'ACAGAGTAACTGC', 'CACGCAAGCGACTA', 'GGGCGGGTAGTACCC'},
-    'GHXGF': {'AAAATGGTCTGTC', 'AATAAGTGAG', 'CGCGACGCCATAGTT'},
-    'XSVNO': {'CCGATCCCGCCCGC', 'GCGGGCCGGCATGCC', 'TTTAGTTGTGTT'},
-    'LPTSW': {'ATTGCTGGACA', 'GCAGTGCCAGTTTC', 'GTCATCGTGCACAT'},
-    'SAPJM': {'AGAGGTACCC', 'CGGGTGAAATT', 'CTGGTCACGAGTT'},
-    'KNGBV': {'AGCACGCACG', 'GAGCGTATCGCAGC'},
-    'YTWYS': {'AATGCAACTGGTT', 'ATGAAATTATT', 'GTACAGACCC'},
-    'IMXVE': {'TAGTGCAACC', 'TGAGACGGACGAT',},
-    'QDKFG': {'CAGGTTTGGCCTGT', 'CCCAGTTACCA', 'GTTTGACTGC'},
-    'GDLYH': {'AACGACAAGCATG', 'TACCCGAGTGTAT', 'TGGGATCTCA'},
-    'XQIRL': {'CACGTGGCGCCGCTT', 'CCGTTTTATTG', 'GTCCTTACATGCCCC'},
-    'BSKUP': {'GAGCCTCTTGCG', 'GAGCGTATCGCAGC'},
-    }
-    variants =  {
-    'OXKSZ': 'ACAGAGTAACTGC' ,
-    'GHXGF': 'AAAATGGTCTGTC',
-    'XSVNO': 'CCGATCCCGCCCGC',
-    'LPTSW': 'ATTGCTGGACA',
-    'SAPJM': 'CTGGTCACGAGTT',
-    'KNGBV': 'CGGGTAGTTGCGAAC',
-    'YTWYS': 'GTACAGACCC',
-    'IMXVE': 'TAGTGCAACC',
-    'QDKFG': 'GTTTGACTGC',
-    'GDLYH': 'TGGGATCTCA',
-    'XQIRL': 'GTCCTTACATGCCCC',
-    'BSKUP': 'TCGACGAATG',
-    }
-    dataset = PromoterDataset(hits, variants, alphabet, max_length = 1200 )
+    with open(args.hits_path, "rb") as f:
+        hits = pickle.load(f)
+    # print(hits.keys())
+    # breakpoint()
+    # hits =  {
+    # 'OXKSZ': {'ACAGAGTAACTGC', 'CACGCAAGCGACTA', 'GGGCGGGTAGTACCC'},
+    # 'GHXGF': {'AAAATGGTCTGTC', 'AATAAGTGAG', 'CGCGACGCCATAGTT'},
+    # 'XSVNO': {'CCGATCCCGCCCGC', 'GCGGGCCGGCATGCC', 'TTTAGTTGTGTT'},
+    # 'LPTSW': {'ATTGCTGGACA', 'GCAGTGCCAGTTTC', 'GTCATCGTGCACAT'},
+    # 'SAPJM': {'AGAGGTACCC', 'CGGGTGAAATT', 'CTGGTCACGAGTT'},
+    # 'KNGBV': {'AGCACGCACG', 'GAGCGTATCGCAGC'},
+    # 'YTWYS': {'AATGCAACTGGTT', 'ATGAAATTATT', 'GTACAGACCC'},
+    # 'IMXVE': {'TAGTGCAACC', 'TGAGACGGACGAT',},
+    # 'QDKFG': {'CAGGTTTGGCCTGT', 'CCCAGTTACCA', 'GTTTGACTGC'},
+    # 'GDLYH': {'AACGACAAGCATG', 'TACCCGAGTGTAT', 'TGGGATCTCA'},
+    # 'XQIRL': {'CACGTGGCGCCGCTT', 'CCGTTTTATTG', 'GTCCTTACATGCCCC'},
+    # 'BSKUP': {'GAGCCTCTTGCG', 'GAGCGTATCGCAGC'},
+    # }
+    # variants =  {
+    # 'OXKSZ': 'ACAGAGTAACTGC' ,
+    # 'GHXGF': 'AAAATGGTCTGTC',
+    # 'XSVNO': 'CCGATCCCGCCCGC',
+    # 'LPTSW': 'ATTGCTGGACA',
+    # 'SAPJM': 'CTGGTCACGAGTT',
+    # 'KNGBV': 'CGGGTAGTTGCGAAC',
+    # 'YTWYS': 'GTACAGACCC',
+    # 'IMXVE': 'TAGTGCAACC',
+    # 'QDKFG': 'GTTTGACTGC',
+    # 'GDLYH': 'TGGGATCTCA',
+    # 'XQIRL': 'GTCCTTACATGCCCC',
+    # 'BSKUP': 'TCGACGAATG',
+    # }
+    dataset = PromoterDataset(hits, {}, alphabet, max_length = 6000 )
     
     # get variants to score
-    
+    print("-------generating prompt--------")
     msa_sequences = [
-        np.array(dataset.get_inference_seqs(v, id)) for id, v in variants.items()
+        np.array(dataset.get_inference_seqs(v, id)) for (id, v) in zip(names, variants)
     ]
     # print("a", msa_sequences)
     # breakpoint()
-    variants = [
+    variants = variants = [
         append_startstop(alphabet.encode(v.encode('utf-8')), alphabet=alphabet)
-        for v in variants.values()
+        for v in variants
+    ]
+
+    wt =  [
+        append_startstop(alphabet.encode(v.encode('utf-8')), alphabet=alphabet)
+        for v in wt
     ]
 
     # score the variants
     logps = []
-
-    for i, var in tqdm(enumerate(variants)):
+    print("-------scoring variants--------")
+    for i, (w ,var) in tqdm(enumerate(zip(wt, variants)), total=len(wt)):
         msa = msa_sequences[i]
         # wt = wt_seqs[i]
         # breakpoint()
@@ -297,7 +311,7 @@ def main():
         
         forward_logps = get_logps_tiered_fast(
             msa_sequences=msa,
-            variants=[np.ascontiguousarray([var])],
+            variants=[np.ascontiguousarray([var, w])],
             model=model,
             batch_size=args.batch_size,
             alphabet=alphabet,
@@ -305,18 +319,20 @@ def main():
         )
         backward_logps = get_logps_tiered_fast(
             msa_sequences=[np.ascontiguousarray(s[::-1]) for s in msa],
-            variants=[np.ascontiguousarray(var[::-1])],
+            variants=[np.ascontiguousarray(var[::-1]), np.ascontiguousarray(w[::-1])],
             model=model,
             batch_size=args.batch_size,
             alphabet=alphabet,
             pbar_position=PBAR_POSITION,
         )
         curr_logps = (forward_logps + backward_logps) / 2
-        logps.append(curr_logps)
-        print(curr_logps)
-    # logps = np.vstack(logps).mean(axis=0)
-    np.save(args.output_npy_path, logps)
 
+        logps.append(curr_logps)
+        # print(curr_logps)
+    # logps = np.vstack(logps).mean(axis=0)
+    logps = np.array(logps)
+    print(logps.shape)
+    np.save(args.output_npy_path, logps)
 
 if __name__ == "__main__":
     main()

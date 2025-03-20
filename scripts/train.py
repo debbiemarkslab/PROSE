@@ -82,8 +82,11 @@ class PromoterDataset(Dataset):
         return self.pack_inputs(sampled_set, self.alphabet, self.max_len)
 
     def get_inference_seqs(self, variant: str,id: str):
-        sampled_set = self.diverse_sample_and_fit_sequences(id)
-        
+        # sampled_set = self.diverse_sample_and_fit_sequences(id)
+        try:
+            sampled_set = self.sample_and_fit_sequences(id, max_seq_length=self.max_len, sequence=variant)
+        except KeyError:
+            return []
         return sampled_set["passages"]
 
     def sample_query(self, id: str, p_human: float) -> str:
@@ -113,18 +116,17 @@ class PromoterDataset(Dataset):
         include_query: bool = True,
         truncate: bool = False,
         p_human: float = 0.3,
-
+        sequence = None
     ) -> Dict[str, Any]:
         """
         refer to docs of sample_and_fit_sequences
 
         uses k-DPP sampling to maximize diversity within a subset based on hamming distance 
         """
-        if query_id_or_sequence is None:
-
-            query_sequence = self.sample_query(query_id_or_sequence, p_human) # P(human sequence) = 0.3
-        else:
-            query_sequence  = query_id_or_sequence
+        # if query_id_or_sequence is None:
+        query_sequence = self.sample_query(query_id_or_sequence, p_human) # P(human sequence) = 0.3
+        # else:
+        #     query_sequence  = query_id_or_sequence
 
         query_length = len(query_sequence) + self.num_special_characters if query_sequence else None
         
@@ -187,6 +189,7 @@ class PromoterDataset(Dataset):
         truncate: bool = False,
         chunk_size: int = 2,
         max_skips: int = 2,
+        sequence = None
     ) -> Dict[str, Any]:
         """
         Packs sequences until max length is reached. Can exclude query and use deterministic ordering.
@@ -213,9 +216,11 @@ class PromoterDataset(Dataset):
             if len(seq) + self.num_special_characters > max_len:
                 return seq[:max_len - self.num_special_characters]
             return seq
-
-        # Retrieve and possibly truncate the query
-        query_sequence = self.queries[query_id_or_sequence] # human sequence
+        
+        if sequence is None:
+            query_sequence = self.sample_query(query_id_or_sequence, 1) # P(human sequence) = 0.3
+        else:
+            query_sequence  = sequence
         
         # Apply individual sequence length limit if specified
         if max_individual_seq_length and query_sequence:
