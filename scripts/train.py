@@ -591,32 +591,26 @@ class PromoterModel(lightning.LightningModule):
         segment_sizes = batch["segment_sizes"]
         logits = self.model(xs, segment_sizes)
 
+        
+
         # Calculate loss (next token prediction)
         targets = xs[:, 1:].contiguous()  # Shift targets by 1
         logits = logits[:, :-1, :].contiguous()  # Remove last logit
-        # logits = self._clamp(logits)
-        # loss = F.cross_entropy(
-        #     self._clamp(logits.view(-1, logits.size(-1))),
-        #     self._clamp(targets.view(-1)),
-        #     ignore_index=IGNORE_INDEX,
-        # )
-        # logits = torch.nn.functional.softmax(logits, dim=-1)
-        # print(logits.sum(dim=-1))
+
+        query_positions = self.compute_last_segment_positions(segment_sizes)
+        query_loss = self.calculate_individual_losses(logits, targets, 
+                                                      query_positions=query_positions)
+      
         sequence_loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
             targets.reshape(-1),
             reduction='mean',
             ignore_index=IGNORE_INDEX
         )
-        
-        # # Reshape loss and apply mask
-        # loss = loss.reshape(logits.size(0), -1)
-        # valid_positions = (targets != -100).float()
-        # sequence_loss = ((loss * valid_positions).sum(dim=1) / (valid_positions.sum(dim=1))).mean()
-        
+
         # Handle any NaN or Inf values
         if not torch.isfinite(sequence_loss).all():
-            print(sequence_loss)
+            print("NaN occurred, loss: ", sequence_loss)
             # self.log(f'nan_inf_detected', 1.0, sync_dist=True)
             sequence_loss = torch.where(
                 torch.isfinite(sequence_loss), 
@@ -628,6 +622,8 @@ class PromoterModel(lightning.LightningModule):
         perplexity = torch.exp(sequence_loss)
         self.log("train_loss", sequence_loss)
         self.log("train_perplexity", perplexity)
+        self.log("train_query_loss", query_loss.mean())
+
         return sequence_loss
     
     def validation_step(self, batch, batch_idx):
@@ -638,6 +634,10 @@ class PromoterModel(lightning.LightningModule):
         # Calculate loss (next token prediction)
         targets = xs[:, 1:].contiguous()  # Shift targets by 1
         logits = logits[:, :-1, :].contiguous()  # Remove last logit
+
+        query_positions = self.compute_last_segment_positions(segment_sizes)
+        query_loss = self.calculate_individual_losses(logits, targets, 
+                                                      query_positions=query_positions)
       
         loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
@@ -646,9 +646,10 @@ class PromoterModel(lightning.LightningModule):
             reduction='mean'
         )
         perplexity = torch.exp(loss)
-
+        
         self.log("validation_loss", loss)
         self.log("validation_perplexity", perplexity)
+        self.log("validation_query_loss", query_loss.mean())
 
         return loss
 
@@ -677,6 +678,84 @@ class PromoterModel(lightning.LightningModule):
 
     def _clamp(self, x: torch.Tensor, minimum=0.0001) -> torch.Tensor:
         return x.clamp(min=torch.Tensor([minimum]).to(x.dtype).cuda())
+    
+    def calculate_individual_losses(self, shift_logits, shift_labels, padding_idx=IGNORE_INDEX, query_positions=None):
+        """
+        Calculate loss for each sequence in the batch, exactly matching HuggingFace's implementation.
+        Not calculating log of outputs
+        """
+        batch_size, _, vocab_size = shift_logits.size()
+        
+        # # Shift logits and labels: we predict everything except last token
+        # shift_logits = logits[:, :-1, :].contiguous()
+        # shift_labels = labels[:, 1:].contiguous()
+        
+        # Flatten the tokens
+        flat_shift_logits = shift_logits.view(-1, vocab_size)
+        flat_shift_labels = shift_labels.view(-1)
+        
+        # Get per-token losses (with reduction='none' to get per-token values)
+        token_losses = F.cross_entropy(flat_shift_logits, 
+                                        flat_shift_labels, 
+                                        reduction='none', 
+                                        ignore_index=padding_idx)
+        token_losses = token_losses.view(batch_size, -1)
+        
+        # Create mask for valid positions (non-padding)
+        mask = (shift_labels != padding_idx).float()
+        
+        # If query positions provided, only calculate loss for query tokens
+        if query_positions is not None:
+            query_mask = torch.zeros_like(mask)
+            for i, (start, end) in enumerate(query_positions):
+                # Adjust positions to account for the shift
+                query_mask[i, (start-1):(end-1)] = 1.0
+            mask = mask * query_mask
+        
+        # Calculate average loss per sequence
+        seq_lengths = mask.sum(dim=1).clamp(min=1)
+        individual_losses = (token_losses * mask).sum(dim=1) / seq_lengths
+        
+        return individual_losses
+    
+    def compute_last_segment_positions(self, segment_sizes):
+        """
+        Computes the start and end positions of the last valid segment for each item in the batch.
+        
+        Args:
+            segment_sizes: Tensor of shape [batch_size, max_num_segments] containing the sizes
+                        of segments for each batch item. Padded with zeros for shorter sequences.
+        
+        Returns:
+            List of tuples (start_pos, end_pos) for each batch item, where:
+                - start_pos is the starting position of the last segment (inclusive)
+                - end_pos is the ending position of the last segment (exclusive)
+        """
+        batch_size = segment_sizes.size(0)
+        
+        # Create a mask of valid segments (non-zero size)
+        valid_segments_mask = (segment_sizes > 0)
+        
+        # For each batch item, find the index of the last valid segment
+        last_valid_segment_idx = torch.sum(valid_segments_mask, dim=1) - 1  # [batch_size]
+        
+        # Initialize lists to store start and end positions
+        query_positions = []
+        
+        for i in range(batch_size):
+           
+            # Get the index of the last valid segment
+            last_idx = last_valid_segment_idx[i].item()
+            
+            # Calculate start position by summing all previous segment sizes
+            start_pos = torch.sum(segment_sizes[i, :last_idx]).item()
+            
+            # Calculate end position by adding the size of the last segment
+            end_pos = start_pos + segment_sizes[i, last_idx].item()      
+            query_positions.append((start_pos, end_pos))
+            
+        return query_positions
+
 
     
 def compute_similarity_matrix(strings):
@@ -948,7 +1027,7 @@ def main():
 
     checkpoint_callback = ModelCheckpoint(
         dirpath='model/',
-        filename='{epoch}-{val_loss:.2f}-{other_metric:.2f}',
+        filename='qloss_{epoch}-{val_loss:.2f}-{other_metric:.2f}',
         save_top_k = -1,
         every_n_epochs = 1
 
@@ -965,8 +1044,8 @@ def main():
         precision="bf16",
         # gradient_clip_val=0.5,
         # gradient_clip_algorithm="value"
-        strategy="ddp",
-        devices=2,
+        # strategy="ddp",
+        devices=1,
         val_check_interval=0.5,
         callbacks=[checkpoint_callback]
     )
