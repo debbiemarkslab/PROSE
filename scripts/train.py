@@ -14,6 +14,7 @@ import random
 
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.utilities.grads import grad_norm
+from lightning.pytorch.callbacks import ModelCheckpoint
 import math
 from Levenshtein import distance as levenshtein_distance
 IGNORE_INDEX = -100
@@ -77,14 +78,15 @@ class PromoterDataset(Dataset):
         weighted by the number of sequences the gene has   
         '''
         id = np.random.choice(self.ids, p = self.sampling_weights)
-        # sampled_set = self.sample_and_fit_sequences(id, weights = None, max_individual_seq_length=None, max_seq_length=self.max_len)
-        sampled_set = self.diverse_sample_and_fit_sequences(id, max_seq_length=self.max_len)
+        sampled_set = self.sample_and_fit_sequences(id, weights = None, max_individual_seq_length=None, max_seq_length=self.max_len)
+        # sampled_set = self.diverse_sample_and_fit_sequences(id, max_seq_length=self.max_len)
         return self.pack_inputs(sampled_set, self.alphabet, self.max_len)
 
     def get_inference_seqs(self, variant: str,id: str):
-        # sampled_set = self.diverse_sample_and_fit_sequences(id)
         try:
-            sampled_set = self.sample_and_fit_sequences(id, max_seq_length=self.max_len, sequence=variant)
+            sampled_set = self.sample_and_fit_sequences(id, sequence=variant, max_seq_length=self.max_len)
+
+            # sampled_set = self.diverse_sample_and_fit_sequences(id, max_seq_length=self.max_len, sequence=variant)
         except KeyError:
             return []
         return sampled_set["passages"]
@@ -123,56 +125,65 @@ class PromoterDataset(Dataset):
 
         uses k-DPP sampling to maximize diversity within a subset based on hamming distance 
         """
-        # if query_id_or_sequence is None:
-        query_sequence = self.sample_query(query_id_or_sequence, p_human) # P(human sequence) = 0.3
-        # else:
-        #     query_sequence  = query_id_or_sequence
+        if sequence is None:
+            query_sequence = self.sample_query(query_id_or_sequence, p_human) # P(human sequence) = 0.3
+        else:
+            query_sequence  = sequence
 
         query_length = len(query_sequence) + self.num_special_characters if query_sequence else None
         
         # Calculate effective length for passages
         effective_length = max_seq_length - (query_length if query_length is not None else 0)
         
-        passages = []
-        passage_lengths = []
         total_tokens = query_length if query_length is not None else 0
         leftover = effective_length
 
-        # sample enough sequences to meet the max length if possible 
-        K = min(len(self.sequences[query_id_or_sequence]),effective_length // 1000 + 1)
+        max_iters = 200
+        beta = 0.2
+        rounds = 0
+        S = {}
+        score = 0
 
-        sampled_ids = kdpp_select_diverse_seqs(self.sequences[query_id_or_sequence], k= K)
-    
-        for seq in sampled_ids:
-            if not seq:
-                continue
-
-            seq_len = len(seq) + self.num_special_characters
-            if seq_len <= leftover:
-                passages.append(seq)
-                passage_lengths.append(seq_len)
-                leftover -= seq_len
-                total_tokens += seq_len
-            
-            elif truncate and leftover > 0:
-                # Truncate to fit remaining space
-                trunc_len = leftover - self.num_special_characters
-                seq = seq[:trunc_len]
-                passages.append(seq)
-                passage_lengths.append(leftover)
-                total_tokens += leftover
-                leftover = 0
-                break
-            
-            if leftover <= 0:
-                break       
-        # print(passages)   
+        while leftover > 0 and rounds < max_iters:
+            rounds += 1
+            if random.random() < 0.5:
+            # Uniformly randomly select an element from V
+                s = random.choice(self.sequences[query_id_or_sequence])
+                if s not in S:
+                    # Attempt to add s
+                    new_score = 0
+                    for t in S.keys():
+                        new_score += levenshtein_distance(t, s) / max(len(t), len(s))
+                    new_score /= (len(S) + 1)**2
+                    
+                    p_add = math.exp(beta * (score+new_score)) / (math.exp(beta * score) + math.exp(beta * (score+new_score)))
+                    if random.random() < p_add:
+                        S[s] = len(s)
+                        l = (len(s) + self.num_special_characters)
+                        score += new_score
+                        leftover -= l
+                        total_tokens += l
+                        
+                elif s in S:
+                    # Attempt to delete s
+                    new_score = 0
+                    for t in S.keys():
+                        new_score += levenshtein_distance(t, s) / max(len(t), len(s))
+                    new_score /= (len(S) + 1)**2
+                    p_delete = math.exp(beta * (score - new_score)) / (math.exp(beta * score) + math.exp(beta * (score - new_score)))
+                    if random.random() < p_delete:
+                        del S[s]
+                        l = (len(s) + self.num_special_characters)
+                        leftover += l
+                        total_tokens -= l
+                        score -= new_score
+           
         #                                  
         return {
             "id": query_id_or_sequence if include_query else None,
             "sequence": query_sequence,
-            "passages": passages,
-            "passage_lengths": passage_lengths,
+            "passages": list(S.keys()),
+            "passage_lengths": list(S.values()),
             "query_length": query_length,
             "total_tokens": total_tokens
         }
@@ -217,10 +228,11 @@ class PromoterDataset(Dataset):
                 return seq[:max_len - self.num_special_characters]
             return seq
         
-        if sequence is None:
-            query_sequence = self.sample_query(query_id_or_sequence, 1) # P(human sequence) = 0.3
+        if sequence is not None:
+            query_sequence = sequence
         else:
-            query_sequence  = sequence
+            query_sequence = self.sample_query(query_id_or_sequence, 0.3) # P(human sequence) = 0.3
+        
         
         # Apply individual sequence length limit if specified
         if max_individual_seq_length and query_sequence:
@@ -238,6 +250,7 @@ class PromoterDataset(Dataset):
 
         
         member_ids = self.sequences[query_id_or_sequence]
+
         if sample:
             member_weights = np.array(weights if weights is not None else [1.0 / len(member_ids)] * len(member_ids))
             member_weights /= member_weights.sum()
@@ -851,7 +864,7 @@ def main():
         "--num_epochs", type=int, default=10, help="Number of training epochs"
     )
     parser.add_argument(
-        "--max_len", type=int, default=1000, help="Maximum sequence length"
+        "--max_len", type=int, default=16000, help="Maximum sequence length"
     )
     parser.add_argument(
         "--initial_learning_rate",
@@ -896,15 +909,15 @@ def main():
     'BSKUP': 'TCGACGAATG',
     }
 
-    # with open("data/hits.pkl", "rb") as f:
-    #     h = pickle.load(f)
-    # with open("data/query.pkl", "rb") as f:
-    #     q = pickle.load(f)
+    with open("data/hits.pkl", "rb") as f:
+        h = pickle.load(f)
+    with open("data/query.pkl", "rb") as f:
+        q = pickle.load(f)
 
     # example, example_query, val_example, val_query = PromoterDataset.train_validation_split( chr= 19, sequences=example, queries=example_query)
 
-    # train_seq, train_query, val_seq, val_query  = PromoterDataset._train_validation_split(19, h, q)
-    train_seq, train_query, val_seq, val_query  = PromoterDataset.train_validation_split(19, h, q)
+    train_seq, train_query, val_seq, val_query  = PromoterDataset._train_validation_split(19, h, q)
+    # train_seq, train_query, val_seq, val_query  = PromoterDataset.train_validation_split(19, h, q)
 
 
     alphabet = ATCG(
@@ -932,6 +945,14 @@ def main():
         shuffle=False,
         collate_fn=val_dataset.padded_collate_packed,
     )
+
+    checkpoint_callback = ModelCheckpoint(
+        dirpath='model/',
+        filename='{epoch}-{val_loss:.2f}-{other_metric:.2f}',
+        save_top_k = -1,
+        every_n_epochs = 1
+
+    )
     
     trainer = lightning.Trainer(
         max_epochs=args.num_epochs,
@@ -944,9 +965,10 @@ def main():
         precision="bf16",
         # gradient_clip_val=0.5,
         # gradient_clip_algorithm="value"
-        # strategy="ddp",
-        devices=1,
-        val_check_interval=0.5
+        strategy="ddp",
+        devices=2,
+        val_check_interval=0.5,
+        callbacks=[checkpoint_callback]
     )
     # uniprot = Uniprot21()
     # jit_warmup(model, uniprot)
@@ -955,7 +977,7 @@ def main():
         train_dataloaders=train_loader,
         val_dataloaders= val_loader,
     )
-    trainer.save_checkpoint("first_pass.ckpt")
+    trainer.save_checkpoint("0.3_human_random.ckpt")
    
 
 if __name__ == "__main__":

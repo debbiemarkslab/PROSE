@@ -157,12 +157,12 @@ def _get_logps_tiered_fast(
                 value=alphabet.mask_token,
             )
         assert (this_variants == alphabet.gap_token).sum() == 0
-        this_variants = this_variants.reshape(1, -1).cuda()
-        
+        this_variants = this_variants.cuda()
         logits = model.logits(this_variants[:, :-1], memory, preallocated_memory=True)
         targets = this_variants[:, 1:]
         score = -criteria.forward(logits.transpose(1, 2), targets).float().sum(dim=1)
         logps.append(score.cpu().numpy())
+        
     return np.hstack(logps)
 
 
@@ -202,11 +202,11 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt_path", 
                         type=str, 
-                        default="human_query_random_subset_200k.ckpt")
+                        default="model/epoch=9-val_loss=0.00-other_metric=0.00.ckpt")
 
     parser.add_argument("--variants_path",
                         type=str,
-                        default="data/indels.csv",
+                        default="data/eQTL_with_pip.csv",
     )
 
     parser.add_argument("--output_npy_path",
@@ -215,7 +215,7 @@ def parse_args():
     )
     parser.add_argument("--batch_size", 
                         type=int, 
-                        default=4)
+                        default=2)
     parser.add_argument("--seed", 
                         type=int, 
                         default=188257)
@@ -243,21 +243,28 @@ def main():
     with open(args.hits_path, "rb") as f:
         hits = pickle.load(f)
 
-    dataset = PromoterDataset(hits, {}, alphabet, max_length = 6000 )
-
+    
     print("-------loading model--------")
 
     model = PromoterModel()
     model.load_from_checkpoint(args.ckpt_path)
     model = model.model
     alphabet = ATCG()
-    model = model.cuda().eval()
+    model = model.cuda().half().eval()
+    dataset = PromoterDataset(hits, {}, alphabet, max_length = 16000 )
+
     
     # get homologs to score
     print("-------generating prompt--------")
     msa_sequences = [
-        np.array(dataset.get_inference_seqs(v, id)) for (id, v) in zip(names, variants)
+        # np.array(dataset.get_inference_seqs(v, id)) for (id, v) in zip(names, variants)
     ]
+    for id, v in tqdm(zip(names, variants), total=len(names)):
+        curr = np.array(dataset.get_inference_seqs(v, id))
+        if curr.size == 0:
+            print(f'{id} has no hits!')
+        
+        msa_sequences.append(curr)
     
     variants = variants = [
         append_startstop(alphabet.encode(v.encode('utf-8')), alphabet=alphabet)
@@ -272,52 +279,43 @@ def main():
     # score the variants
     logps = []
     print("-------scoring variants--------")
-    for i, (w ,var) in tqdm(enumerate(zip(wt, variants)), total=len(wt)):
+    torch.cuda.empty_cache()
 
+    for i, (w ,var) in tqdm(enumerate(zip(wt, variants)), total=len(wt)):
+      
         msa = msa_sequences[i]
+        # skip unknown genes
+        if not msa.size:
+            logps.append(None)
+            continue
+
         msa = get_encoded_msa_from_a3m_seqs(msa_sequences=msa, alphabet=alphabet)
-        
+
         forward_logps = get_logps_tiered_fast(
             msa_sequences=msa,
-            variants=[np.ascontiguousarray([var])],
+            variants=[np.array(var), np.array(w)],
             model=model,
             batch_size=args.batch_size,
             alphabet=alphabet,
             pbar_position=PBAR_POSITION,
         )
+       
         backward_logps = get_logps_tiered_fast(
             msa_sequences=[np.ascontiguousarray(s[::-1]) for s in msa],
-            variants=[np.ascontiguousarray(var[::-1])],
+            variants=[np.ascontiguousarray(var[::-1]), np.ascontiguousarray(w[::-1])],
             model=model,
             batch_size=args.batch_size,
             alphabet=alphabet,
             pbar_position=PBAR_POSITION,
         )
 
-        wt_forward_logps = get_logps_tiered_fast(
-            msa_sequences=msa,
-            variants=[np.ascontiguousarray([w])],
-            model=model,
-            batch_size=args.batch_size,
-            alphabet=alphabet,
-            pbar_position=PBAR_POSITION,
-        )
-
-        wt_backward_logps = get_logps_tiered_fast(
-            msa_sequences=[np.ascontiguousarray(s[::-1]) for s in msa],
-            variants=[np.ascontiguousarray(w[::-1])],
-            model=model,
-            batch_size=args.batch_size,
-            alphabet=alphabet,
-            pbar_position=PBAR_POSITION,
-        )
-
-        curr_logps = (forward_logps + backward_logps - wt_forward_logps - wt_backward_logps) / 2
-
+        curr_logps = (forward_logps[0] + backward_logps[0] - forward_logps[1] - backward_logps[1]) / 2
         logps.append(curr_logps)
 
     print("-------saving output--------")
     np.save(args.output_npy_path, logps)
-
+    variants_df['POET'] = logps
+    variants_df.to_csv('data/scored_eQTL.csv')
+    print("-------finished--------")
 if __name__ == "__main__":
     main()
