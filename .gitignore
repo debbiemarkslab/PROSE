@@ -4,6 +4,7 @@ _version.py
 data/LICENSE
 data/
 wandb/latest-run/
+model/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

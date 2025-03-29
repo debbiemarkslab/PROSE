@@ -1,0 +1,21 @@
+{ 
+    "model": 
+    {
+        "n_vocab": 24,
+        "hidden_dim": 1024,
+        "num_layers": 12,
+        "nhead": 16,
+        "dropout": 0,
+        "use_multi_rotary": true,
+        "norm": true
+        }, 
+    "training": {
+        "reverse": true,
+        "val_chr": 19,
+        "human_query_weight": 0.3,
+        "sampler": "greedy",
+        "epochs": 12,
+        "context_length": 16384,
+        "num_gpu": 2
+    }
+}

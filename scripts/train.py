@@ -10,19 +10,21 @@ from torch_optimizer import Adafactor
 import pickle
 from poet.alphabets import Alphabet, Uniprot21
 from poet.models.poet import PoET
-import random 
+import random
 
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.utilities.grads import grad_norm
 from lightning.pytorch.callbacks import ModelCheckpoint
 import math
+from collections import defaultdict
 from Levenshtein import distance as levenshtein_distance
+
 IGNORE_INDEX = -100
 
 
 class ATCG(Alphabet):
     """
-    tokenize DNA sequence 
+    tokenize DNA sequence
     """
 
     def __init__(
@@ -62,29 +64,39 @@ class PromoterDataset(Dataset):
 
     def __init__(self, sequences: dict, queries: dict, alphabet, max_length):
         self.alphabet = alphabet
-        self.sequences = {k : list(v) for k, v in sequences.items()}
+        self.sequences = {k: list(v) for k, v in sequences.items()}
         self.queries = queries
         self.num_special_characters = 2
         self.ids = list(sequences.keys())
         self.sampling_weights = [len(v) for k, v in self.sequences.items()]
         total = sum(self.sampling_weights)
-        self.sampling_weights = [i/ total for i in self.sampling_weights]
+        self.sampling_weights = [i / total for i in self.sampling_weights]
         self.max_len = max_length
         self.iters = len(self.ids) * 5
 
+        self.counter = defaultdict(int)
+
     def __getitem__(self, idx):
-        '''
+        """
         randomly sample a gene with replacement
-        weighted by the number of sequences the gene has   
-        '''
-        id = np.random.choice(self.ids, p = self.sampling_weights)
-        sampled_set = self.sample_and_fit_sequences(id, weights = None, max_individual_seq_length=None, max_seq_length=self.max_len)
+        weighted by the number of sequences the gene has
+        """
+        id = np.random.choice(self.ids, p=self.sampling_weights)
+        self.counter[id] += 1
+
+        sampled_set = self.greedy_sample_and_fit_sequences(
+            id,
+            max_seq_length=self.max_len,
+        )
+        
         # sampled_set = self.diverse_sample_and_fit_sequences(id, max_seq_length=self.max_len)
         return self.pack_inputs(sampled_set, self.alphabet, self.max_len)
 
-    def get_inference_seqs(self, variant: str,id: str):
+    def get_inference_seqs(self, variant: str, id: str):
         try:
-            sampled_set = self.sample_and_fit_sequences(id, sequence=variant, max_seq_length=self.max_len)
+            sampled_set = self.greedy_sample_and_fit_sequences(
+                id, sequence=variant, max_seq_length=self.max_len
+            )
 
             # sampled_set = self.diverse_sample_and_fit_sequences(id, max_seq_length=self.max_len, sequence=variant)
         except KeyError:
@@ -92,49 +104,55 @@ class PromoterDataset(Dataset):
         return sampled_set["passages"]
 
     def sample_query(self, id: str, p_human: float) -> str:
-        '''
-        sample a query sequence for a given gene, with a chosen probability of 
-        sampling a human sequence 
-        
+        """
+        sample a query sequence for a given gene, with a chosen probability of
+        sampling a human sequence
+
         Args:
-        id: gene name 
-        p_human: percent probability of sampling human 
+        id: gene name
+        p_human: percent probability of sampling human
 
         Returns:
         single sampled DNA sequence as a query
-        '''
+        """
         human = np.random.choice([True, False], p=[p_human, 1 - p_human])
         if human:
             return self.queries[id]
         else:
             return np.random.choice(self.sequences[id])
-        
-    
+
     def diverse_sample_and_fit_sequences(
         self,
-        query_id_or_sequence: Optional[str] = None,  # Changed parameter name to be more explicit
+        query_id_or_sequence: Optional[
+            str
+        ] = None,  # Changed parameter name to be more explicit
         max_seq_length: int = 1024,
-        max_individual_seq_length: Optional[int] = None,
         include_query: bool = True,
-        truncate: bool = False,
         p_human: float = 0.3,
-        sequence = None
+        sequence=None,
     ) -> Dict[str, Any]:
         """
-        refer to docs of sample_and_fit_sequences
-
-        uses k-DPP sampling to maximize diversity within a subset based on hamming distance 
+        MCMC algorithm to stochastically sample a diverse subset, 
+        with temperature and iteration hyperparameters to control mixing time
         """
         if sequence is None:
-            query_sequence = self.sample_query(query_id_or_sequence, p_human) # P(human sequence) = 0.3
+            query_sequence = self.sample_query(
+                query_id_or_sequence, p_human
+            )  # P(human sequence) = 0.3
         else:
-            query_sequence  = sequence
+            query_sequence = sequence
 
-        query_length = len(query_sequence) + self.num_special_characters if query_sequence else None
-        
+        query_length = (
+            len(query_sequence) + self.num_special_characters
+            if query_sequence
+            else None
+        )
+
         # Calculate effective length for passages
-        effective_length = max_seq_length - (query_length if query_length is not None else 0)
-        
+        effective_length = max_seq_length - (
+            query_length if query_length is not None else 0
+        )
+
         total_tokens = query_length if query_length is not None else 0
         leftover = effective_length
 
@@ -147,51 +165,56 @@ class PromoterDataset(Dataset):
         while leftover > 0 and rounds < max_iters:
             rounds += 1
             if random.random() < 0.5:
-            # Uniformly randomly select an element from V
+                # Uniformly randomly select an element from V
                 s = random.choice(self.sequences[query_id_or_sequence])
                 if s not in S:
                     # Attempt to add s
                     new_score = 0
                     for t in S.keys():
                         new_score += levenshtein_distance(t, s) / max(len(t), len(s))
-                    new_score /= (len(S) + 1)**2
-                    
-                    p_add = math.exp(beta * (score+new_score)) / (math.exp(beta * score) + math.exp(beta * (score+new_score)))
+                    new_score /= (len(S) + 1) ** 2
+
+                    p_add = math.exp(beta * (score + new_score)) / (
+                        math.exp(beta * score) + math.exp(beta * (score + new_score))
+                    )
                     if random.random() < p_add:
                         S[s] = len(s)
-                        l = (len(s) + self.num_special_characters)
+                        l = len(s) + self.num_special_characters
                         score += new_score
                         leftover -= l
                         total_tokens += l
-                        
+
                 elif s in S:
                     # Attempt to delete s
                     new_score = 0
                     for t in S.keys():
                         new_score += levenshtein_distance(t, s) / max(len(t), len(s))
-                    new_score /= (len(S) + 1)**2
-                    p_delete = math.exp(beta * (score - new_score)) / (math.exp(beta * score) + math.exp(beta * (score - new_score)))
+                    new_score /= (len(S) + 1) ** 2
+                    p_delete = math.exp(beta * (score - new_score)) / (
+                        math.exp(beta * score) + math.exp(beta * (score - new_score))
+                    )
                     if random.random() < p_delete:
                         del S[s]
-                        l = (len(s) + self.num_special_characters)
+                        l = len(s) + self.num_special_characters
                         leftover += l
                         total_tokens -= l
                         score -= new_score
-           
-        #                                  
+
+        #
         return {
             "id": query_id_or_sequence if include_query else None,
             "sequence": query_sequence,
             "passages": list(S.keys()),
             "passage_lengths": list(S.values()),
             "query_length": query_length,
-            "total_tokens": total_tokens
+            "total_tokens": total_tokens,
         }
-        
 
     def sample_and_fit_sequences(
         self,
-        query_id_or_sequence: Optional[str] = None,  # Changed parameter name to be more explicit
+        query_id_or_sequence: Optional[
+            str
+        ] = None,  # Changed parameter name to be more explicit
         weights: Optional[List[float]] = None,
         max_seq_length: int = 1024,
         max_individual_seq_length: Optional[int] = None,
@@ -200,11 +223,11 @@ class PromoterDataset(Dataset):
         truncate: bool = False,
         chunk_size: int = 2,
         max_skips: int = 2,
-        sequence = None
+        sequence=None,
     ) -> Dict[str, Any]:
         """
         Packs sequences until max length is reached. Can exclude query and use deterministic ordering.
-        
+
         Args:
             query_id_or_sequence: Either a UniRef ID to lookup in fasta_dataset, or the actual sequence
             member_ids: List of UniRef IDs or sequences for passages
@@ -225,49 +248,63 @@ class PromoterDataset(Dataset):
         def truncate_sequence(seq: str, max_len: int) -> str:
             """Helper to truncate a sequence to max length while accounting for special tokens"""
             if len(seq) + self.num_special_characters > max_len:
-                return seq[:max_len - self.num_special_characters]
+                return seq[: max_len - self.num_special_characters]
             return seq
-        
+
         if sequence is not None:
             query_sequence = sequence
         else:
-            query_sequence = self.sample_query(query_id_or_sequence, 0.3) # P(human sequence) = 0.3
-        
-        
+            query_sequence = self.sample_query(
+                query_id_or_sequence, 0.3
+            )  # P(human sequence) = 0.3
+
         # Apply individual sequence length limit if specified
         if max_individual_seq_length and query_sequence:
-            query_sequence = truncate_sequence(query_sequence, max_individual_seq_length)
-        
-        query_length = len(query_sequence) + self.num_special_characters if query_sequence else None
-        
+            query_sequence = truncate_sequence(
+                query_sequence, max_individual_seq_length
+            )
+
+        query_length = (
+            len(query_sequence) + self.num_special_characters
+            if query_sequence
+            else None
+        )
+
         # Calculate effective length for passages
-        effective_length = max_seq_length - (query_length if query_length is not None else 0)
-        
+        effective_length = max_seq_length - (
+            query_length if query_length is not None else 0
+        )
+
         passages = []
         passage_lengths = []
         total_tokens = query_length if query_length is not None else 0
         leftover = effective_length
 
-        
         member_ids = self.sequences[query_id_or_sequence]
 
         if sample:
-            member_weights = np.array(weights if weights is not None else [1.0 / len(member_ids)] * len(member_ids))
+            member_weights = np.array(
+                weights
+                if weights is not None
+                else [1.0 / len(member_ids)] * len(member_ids)
+            )
             member_weights /= member_weights.sum()
-            
+
             skip_rounds = 0
             while leftover > 0 and skip_rounds < max_skips:
-                sampled_ids = np.random.choice(member_ids, size=chunk_size, replace=True, p=member_weights)
+                sampled_ids = np.random.choice(
+                    member_ids, size=chunk_size, replace=True, p=member_weights
+                )
                 added = False
-                
+
                 for seq in sampled_ids:
                     if not seq:
                         continue
-                    
+
                     # Apply individual sequence length limit if specified
                     if max_individual_seq_length:
                         seq = truncate_sequence(seq, max_individual_seq_length)
-                    
+
                     seq_len = len(seq) + self.num_special_characters
                     if seq_len <= leftover:
                         passages.append(seq)
@@ -285,30 +322,158 @@ class PromoterDataset(Dataset):
                         leftover = 0
                         added = True
                         break
-                    
+
                     if leftover <= 0:
                         break
-                        
+
                 skip_rounds = 0 if added else skip_rounds + 1
-           
-                        
+
         return {
             "id": query_id_or_sequence if include_query else None,
             "sequence": query_sequence,
             "passages": passages,
             "passage_lengths": passage_lengths,
             "query_length": query_length,
-            "total_tokens": total_tokens
+            "total_tokens": total_tokens,
+        }
+    
+    def greedy_sample_and_fit_sequences(
+        self,
+        query_id_or_sequence: Optional[
+            str
+        ] = None,  # Changed parameter name to be more explicit
+        max_seq_length: int = 12048,
+        max_individual_seq_length: Optional[int] = None,
+        include_query: bool = True,
+        sequence : str = None,
+        p_human: float = 0.3
+    ) -> Dict[str, Any]:
+        """
+        Iteratively samples a subset of a given total size by selecting sequences that
+        maximize the average Hamming distance to the already selected sequences.
+
+        Args:
+            query_id_or_sequence: Either a UniRef ID to lookup in fasta_dataset, or the actual sequence
+            max_seq_length: Maximum length of all sequences combined
+            max_individual_seq_length: Optional int to limit the length of individual sequences.
+            sequence: Optional provided query sequence 
+            p_human: Optional probability of sampling a human query, if not given
+        Returns:
+            Dict with id, sequence, passages, passage_lengths, query_length, and total_tokens
+        """
+
+        def truncate_sequence(seq: str, max_len: int) -> str:
+            """Helper to truncate a sequence to max length while accounting for special tokens"""
+            if len(seq) + self.num_special_characters > max_len:
+                return seq[: max_len - self.num_special_characters]
+            return seq
+        
+        if sequence is not None:
+            query_sequence = sequence
+        else:
+            query_sequence = self.sample_query(
+                query_id_or_sequence, p_human )  # P(human sequence) = 0.3
+
+        # Apply individual sequence length limit if specified
+        if max_individual_seq_length and query_sequence:
+            query_sequence = truncate_sequence(
+                query_sequence, max_individual_seq_length)
+
+        query_length = (len(query_sequence) + self.num_special_characters if query_sequence else None)
+
+        # Calculate effective length for passages
+        effective_length = max_seq_length - (
+            query_length if query_length is not None else 0)
+
+        passages = []
+        passage_lengths = []
+        total_tokens = query_length if query_length is not None else 0
+        leftover = effective_length  # TOTAL Lengths of the homologs
+
+        member_ids = self.sequences[query_id_or_sequence]
+        n = len(member_ids)
+        m = max(len(s) for s in member_ids)
+
+        data = np.zeros((len(member_ids), m), dtype=np.uint32) # padded sequence ordinals
+        for i, s in enumerate(member_ids):
+            data[i, :len(s)] = [ord(c) for c in s]
+        
+        selected_indices = []
+        available_mask = np.ones(n, dtype=bool)
+
+        # Stores the *sum* of Hamming distances from each string to the selected set
+        sum_distances_to_selected = np.zeros(n, dtype=np.float64)
+
+        # Start with a random sequence
+        start_index = random.randint(0, n - 1)
+        seq_len = (len(member_ids[start_index]) + self.num_special_characters)
+        leftover -= seq_len
+        total_tokens += seq_len
+        passage_lengths.append(seq_len)
+        selected_indices.append(start_index)
+        available_mask[start_index] = False
+        num_selected = 1
+
+        # Calculate initial distances from the first selected string to all others
+        first_selected_data = data[start_index]
+        # Get indices that are still available
+        current_available_indices = np.where(available_mask)[0]
+        if len(current_available_indices) > 0:
+            
+            # Calculate distances from available strings to the first selected one with broadcasting
+            initial_distances = np.sum(data[current_available_indices] != first_selected_data, axis=1)
+            # Update 
+            sum_distances_to_selected[current_available_indices] = initial_distances
+        
+        # iterative greedy sampling
+        while leftover > 0: 
+            if not np.any(available_mask):
+                break
+            current_available_indices = np.where(available_mask)[0]
+
+            # Calculate the *average* Hamming distance for each available candidate
+            avg_distances_candidates = sum_distances_to_selected[current_available_indices] / num_selected
+            best_candidate_local_idx = np.argmax(avg_distances_candidates)
+            best_original_idx = current_available_indices[best_candidate_local_idx]
+
+            # Add the best candidate to the selected set
+            selected_indices.append(best_original_idx)
+            available_mask[best_original_idx] = False
+
+            num_selected += 1
+            seq_len = (self.num_special_characters + len(member_ids[best_original_idx]))
+            leftover -= seq_len
+            total_tokens += seq_len
+            passage_lengths.append(seq_len)
+            # Update the sum_distances for the remaining available strings
+            newly_selected_data = data[best_original_idx]
+            remaining_available_indices = np.where(available_mask)[0] # Indices still available *after* selecting the latest
+
+            if len(remaining_available_indices) == 0:
+                break
+            # Calculate distances of the newly selected one
+            distances_to_new = np.sum(data[remaining_available_indices] != newly_selected_data, axis=1)
+            sum_distances_to_selected[remaining_available_indices] += distances_to_new
+
+        passages = [member_ids[i] for i in selected_indices]
+
+        return {
+            "id": query_id_or_sequence if include_query else None,
+            "sequence": query_sequence,
+            "passages": passages,
+            "passage_lengths": passage_lengths,
+            "query_length": query_length,
+            "total_tokens": total_tokens,
         }
 
     def pack_inputs(
-        self, 
-        sample, 
+        self,
+        sample,
         tokenizer,  # DNA tokenizer instance
-        max_seq_length, 
+        max_seq_length,
         padding_idx=IGNORE_INDEX,
         reverse_sequence=False,
-        skip_padding=True
+        skip_padding=True,
     ):
         """
         Packs a single sample's query and passages into a single sequence, using Uniprot21 tokenization.
@@ -325,7 +490,7 @@ class PromoterDataset(Dataset):
             max_seq_length (int): Maximum length of the packed sequence
             padding_idx (int): Token ID to use for padding
             cls_token (str): Start token character ($ for Uniprot21)
-            eos_token (str): Stop token character (* for Uniprot21) 
+            eos_token (str): Stop token character (* for Uniprot21)
             reverse_sequence (bool): If True, reverse sequences before tokenization
             skip_padding (bool): If True, don't pad sequence to max_seq_length
 
@@ -337,12 +502,12 @@ class PromoterDataset(Dataset):
 
         Example:
             For sequence ABC, passages [DEF, GH] and max_seq_length=14:
-            
+
             Normal order (reverse_sequence=False):
                 tokens:  [$ D E F * $ G H * $ A B C * <pad>]
                 seq_lens: [5, 4, 5]  # Each sequence length includes its start/stop tokens
                 labels:  [$ D E F * $ G H * $ A B C * -100]
-                
+
             Reversed (reverse_sequence=True):
                 tokens:  [* F E D $ * H G $ * C B A $ <pad>]
                 seq_lens: [5, 4, 5]  # Lengths stay same, just content is reversed
@@ -352,34 +517,37 @@ class PromoterDataset(Dataset):
                 Actual tokens will be Uniprot21 token IDs, shown here as characters for clarity
                 Sequences are concatenated: passages first, then query
         """
-        """
-    [previous docstring remains the same]
-    """
+
         def tokenize_sequence(text: str, reverse_sequence: bool) -> np.ndarray:
             if reverse_sequence:
                 text = text[::-1]
             if isinstance(text, str):
-                text_bytes = text.encode('ascii')
+                text_bytes = text.encode("ascii")
             else:
                 text_bytes = text  # Already bytes
             tokens = tokenizer.encode(text_bytes)
             if reverse_sequence:
-                return np.concatenate([[tokenizer.stop_token], tokens, [tokenizer.start_token]])
+                return np.concatenate(
+                    [[tokenizer.stop_token], tokens, [tokenizer.start_token]]
+                )
             else:
-                return np.concatenate([[tokenizer.start_token], tokens, [tokenizer.stop_token]])
+                return np.concatenate(
+                    [[tokenizer.start_token], tokens, [tokenizer.stop_token]]
+                )
 
         # Initialize sequences and lengths
         all_sequences = []
-        all_lengths = sample["passage_lengths"].copy()  # Use pre-calculated passage lengths
-        
+        all_lengths = sample[
+            "passage_lengths"
+        ].copy()  # Use pre-calculated passage lengths
+
         # Process passages
         if sample["passages"]:
             for seq in sample["passages"]:
                 if seq is not None:
                     tokens = tokenize_sequence(seq, reverse_sequence)
                     all_sequences.append(tokens)
-        
-        
+
         # Process query if it exists
         query_sequence = sample["sequence"]
         if query_sequence is not None:
@@ -387,14 +555,14 @@ class PromoterDataset(Dataset):
             all_sequences.append(tokens)
             # Use pre-calculated query length
             all_lengths.append(sample["query_length"])
-        
+
         # Concatenate all sequences
         if all_sequences:
             tokens = np.concatenate(all_sequences)
             tokens = torch.from_numpy(tokens).long()
         else:
             tokens = torch.empty(0, dtype=torch.long)
-        
+
         # Add padding if needed
         current_length = sum(all_lengths)
         if not skip_padding and current_length < max_seq_length:
@@ -402,7 +570,7 @@ class PromoterDataset(Dataset):
             all_lengths.append(padding_length)
             padding = torch.full((padding_length,), padding_idx, dtype=tokens.dtype)
             tokens = torch.cat([tokens, padding])
-        
+
         # Create labels (same as tokens but with padding masked)
 
         return {
@@ -436,7 +604,7 @@ class PromoterDataset(Dataset):
         # If pad_mode is None, default to "largest"
         if pad_mode is None:
             pad_mode = "largest"
-        
+
         # Determine target length for tokens
         token_lengths = [x["tokens"].size(0) for x in batch]
         if pad_mode == "largest":
@@ -451,7 +619,7 @@ class PromoterDataset(Dataset):
             raise ValueError("Unknown pad_mode. Use 'largest', 'fixed', or None.")
 
         padded_tokens = []
-   
+
         for x in batch:
             token = x["tokens"]
             pad_len = target_length - token.size(0)
@@ -459,7 +627,6 @@ class PromoterDataset(Dataset):
                 token = F.pad(token, (0, pad_len), value=padding_idx)
             padded_tokens.append(token)
         tokens_tensor = torch.stack(padded_tokens, dim=0)
-
 
         # Collate segment sizes (each sample may have several segments).
         max_segments = max(len(x["seq_lens"]) for x in batch)
@@ -473,7 +640,7 @@ class PromoterDataset(Dataset):
             "tokens": tokens_tensor,
             "segment_sizes": segment_sizes,
         }
-       
+
         collated_batch = self._to_cuda(collated_batch)
         return collated_batch
 
@@ -482,13 +649,17 @@ class PromoterDataset(Dataset):
 
     def _to_cuda(self, tok_dict):
         return {k: v.long().cuda() for k, v in tok_dict.items()}
-    
+
     @staticmethod
-    def train_validation_split(chr: int, sequences: dict, queries: dict) -> Tuple[Dict, Dict, Dict, Dict]:
+    def train_validation_split(
+        chr: int, sequences: dict, queries: dict
+    ) -> Tuple[Dict, Dict, Dict, Dict]:
         return sequences, queries, sequences, queries
-    
+
     @staticmethod
-    def _train_validation_split(chr: int, sequences: dict, queries: dict) -> Tuple[Dict, Dict, Dict, Dict]:
+    def _train_validation_split(
+        chr: int, sequences: dict, queries: dict
+    ) -> Tuple[Dict, Dict, Dict, Dict]:
         """
         splits two dictionaries based on the chromosome number of the keys
 
@@ -511,8 +682,7 @@ class PromoterDataset(Dataset):
         print(f"training with {len(train_query)} sequences")
         print(f"validating with {len(val_query)} sequences")
 
-        return train_seq, train_query, val_seq, val_query   
-
+        return train_seq, train_query, val_seq, val_query
 
 
 def jit_warmup(embedding_model: PoET, alphabet: Uniprot21):
@@ -526,43 +696,49 @@ def jit_warmup(embedding_model: PoET, alphabet: Uniprot21):
 
 
 class SqrtDecayScheduler(torch.optim.lr_scheduler._LRScheduler):
-    ''' 
+    """
     Used in original PoET Training
-    '''
-    def __init__(self, 
-                 optimizer,
-                 last_epoch: int = -1,
-                 verbose: bool = False,
-                 scaling_factor: float = 1.0,
-                 offset: int = 0):
-        
+    """
+
+    def __init__(
+        self,
+        optimizer,
+        last_epoch: int = -1,
+        verbose: bool = False,
+        scaling_factor: float = 1.0,
+        offset: int = 0,
+    ):
+
         self.scaling_factor = scaling_factor
         self.offset = offset
         super().__init__(optimizer, last_epoch, verbose)
-        
+
     def get_lr(self) -> list[float]:
         """Compute scaled learning rate using sqrt decay"""
-        return [base_lr * self.scaling_factor / math.sqrt(self.last_epoch + 1 + self.offset)
-                for base_lr in self.base_lrs]
+        return [
+            base_lr * self.scaling_factor / math.sqrt(self.last_epoch + 1 + self.offset)
+            for base_lr in self.base_lrs
+        ]
 
-    def theoretical_bound(self, 
-                         total_steps: int,
-                         gradient_bound: float) -> float:
+    def theoretical_bound(self, total_steps: int, gradient_bound: float) -> float:
         """
         Theoretical convergence bound for convex functions with L-Lipschitz gradients:
-        
+
         f(x̄_T) - f(x^*) ≤ (2D²L + D√(2σ²T)) / √T
-        
+
         Where:
         - D: Diameter of feasible set
         - L: Lipschitz constant
         - σ²: Gradient variance bound
         - T: Total number of steps
-        
+
         Returns expected optimization error bound
         """
-        return (2 * self.scaling_factor**2 * gradient_bound**2 + 
-                self.scaling_factor * math.sqrt(2 * gradient_bound**2 * total_steps)) / torch.sqrt(total_steps)
+        return (
+            2 * self.scaling_factor**2 * gradient_bound**2
+            + self.scaling_factor * math.sqrt(2 * gradient_bound**2 * total_steps)
+        ) / torch.sqrt(total_steps)
+
 
 class PromoterModel(lightning.LightningModule):
     def __init__(self):
@@ -580,9 +756,9 @@ class PromoterModel(lightning.LightningModule):
         self.model = PoET(**init).cuda()
 
     def forward(self, xs: torch.Tensor, segment_sizes: torch.Tensor) -> torch.Tensor:
-        if (torch.isnan(xs).any() or torch.isnan(segment_sizes).any()):
+        if torch.isnan(xs).any() or torch.isnan(segment_sizes).any():
             raise Exception("NAN in INPUT!!")
-        
+
         # print(xs.shape, segment_sizes.shape)
         return self.model(xs, segment_sizes)
 
@@ -591,21 +767,20 @@ class PromoterModel(lightning.LightningModule):
         segment_sizes = batch["segment_sizes"]
         logits = self.model(xs, segment_sizes)
 
-        
-
         # Calculate loss (next token prediction)
         targets = xs[:, 1:].contiguous()  # Shift targets by 1
         logits = logits[:, :-1, :].contiguous()  # Remove last logit
 
         query_positions = self.compute_last_segment_positions(segment_sizes)
-        query_loss = self.calculate_individual_losses(logits, targets, 
-                                                      query_positions=query_positions)
-      
+        query_loss = self.calculate_individual_losses(
+            logits, targets, query_positions=query_positions
+        )
+
         sequence_loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
             targets.reshape(-1),
-            reduction='mean',
-            ignore_index=IGNORE_INDEX
+            reduction="mean",
+            ignore_index=IGNORE_INDEX,
         )
 
         # Handle any NaN or Inf values
@@ -613,9 +788,9 @@ class PromoterModel(lightning.LightningModule):
             print("NaN occurred, loss: ", sequence_loss)
             # self.log(f'nan_inf_detected', 1.0, sync_dist=True)
             sequence_loss = torch.where(
-                torch.isfinite(sequence_loss), 
-                sequence_loss, 
-                torch.tensor(0.0, device=sequence_loss.device)
+                torch.isfinite(sequence_loss),
+                sequence_loss,
+                torch.tensor(0.0, device=sequence_loss.device),
             )
             self.zero_grad()
 
@@ -625,7 +800,7 @@ class PromoterModel(lightning.LightningModule):
         self.log("train_query_loss", query_loss.mean())
 
         return sequence_loss
-    
+
     def validation_step(self, batch, batch_idx):
         xs = batch["tokens"]
         segment_sizes = batch["segment_sizes"]
@@ -636,17 +811,18 @@ class PromoterModel(lightning.LightningModule):
         logits = logits[:, :-1, :].contiguous()  # Remove last logit
 
         query_positions = self.compute_last_segment_positions(segment_sizes)
-        query_loss = self.calculate_individual_losses(logits, targets, 
-                                                      query_positions=query_positions)
-      
+        query_loss = self.calculate_individual_losses(
+            logits, targets, query_positions=query_positions
+        )
+
         loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
             ignore_index=IGNORE_INDEX,
-            reduction='mean'
+            reduction="mean",
         )
         perplexity = torch.exp(loss)
-        
+
         self.log("validation_loss", loss)
         self.log("validation_perplexity", perplexity)
         self.log("validation_query_loss", query_loss.mean())
@@ -654,20 +830,19 @@ class PromoterModel(lightning.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        opt =  Adafactor(
+        opt = Adafactor(
             self.model.parameters(),
             lr=1e-4,
         )
         # scheduler = SqrtDecayScheduler(opt)
-        return [opt]#, [scheduler]
+        return [opt]  # , [scheduler]
         # return torch.optim.Adam(self.model.parameters(), lr=1e-3)
-    
+
     def initialize_model(self):
         self.model.train()
         for param in self.model.parameters():
             if param.dim() > 1:
                 torch.nn.init.kaiming_uniform_(param)
-
 
     def on_before_optimizer_step(self, optimizer):
         # Compute the 2-norm for each layer
@@ -678,94 +853,93 @@ class PromoterModel(lightning.LightningModule):
 
     def _clamp(self, x: torch.Tensor, minimum=0.0001) -> torch.Tensor:
         return x.clamp(min=torch.Tensor([minimum]).to(x.dtype).cuda())
-    
-    def calculate_individual_losses(self, shift_logits, shift_labels, padding_idx=IGNORE_INDEX, query_positions=None):
+
+    def calculate_individual_losses(
+        self, shift_logits, shift_labels, padding_idx=IGNORE_INDEX, query_positions=None
+    ):
         """
         Calculate loss for each sequence in the batch, exactly matching HuggingFace's implementation.
         Not calculating log of outputs
         """
         batch_size, _, vocab_size = shift_logits.size()
-        
-        # # Shift logits and labels: we predict everything except last token
-        # shift_logits = logits[:, :-1, :].contiguous()
-        # shift_labels = labels[:, 1:].contiguous()
-        
+
         # Flatten the tokens
         flat_shift_logits = shift_logits.view(-1, vocab_size)
         flat_shift_labels = shift_labels.view(-1)
-        
+
         # Get per-token losses (with reduction='none' to get per-token values)
-        token_losses = F.cross_entropy(flat_shift_logits, 
-                                        flat_shift_labels, 
-                                        reduction='none', 
-                                        ignore_index=padding_idx)
+        token_losses = F.cross_entropy(
+            flat_shift_logits,
+            flat_shift_labels,
+            reduction="none",
+            ignore_index=padding_idx,
+        )
         token_losses = token_losses.view(batch_size, -1)
-        
+
         # Create mask for valid positions (non-padding)
         mask = (shift_labels != padding_idx).float()
-        
+
         # If query positions provided, only calculate loss for query tokens
         if query_positions is not None:
             query_mask = torch.zeros_like(mask)
             for i, (start, end) in enumerate(query_positions):
                 # Adjust positions to account for the shift
-                query_mask[i, (start-1):(end-1)] = 1.0
+                query_mask[i, (start - 1) : (end - 1)] = 1.0
             mask = mask * query_mask
-        
+
         # Calculate average loss per sequence
         seq_lengths = mask.sum(dim=1).clamp(min=1)
         individual_losses = (token_losses * mask).sum(dim=1) / seq_lengths
-        
+
         return individual_losses
-    
+
     def compute_last_segment_positions(self, segment_sizes):
         """
         Computes the start and end positions of the last valid segment for each item in the batch.
-        
+
         Args:
             segment_sizes: Tensor of shape [batch_size, max_num_segments] containing the sizes
                         of segments for each batch item. Padded with zeros for shorter sequences.
-        
+
         Returns:
-            List of tuples (start_pos, end_pos) for each batch item, where:
-                - start_pos is the starting position of the last segment (inclusive)
-                - end_pos is the ending position of the last segment (exclusive)
+            List of tuples (start_pos, end_pos) for each batch item
         """
         batch_size = segment_sizes.size(0)
-        
+
         # Create a mask of valid segments (non-zero size)
-        valid_segments_mask = (segment_sizes > 0)
-        
+        valid_segments_mask = segment_sizes > 0
+
         # For each batch item, find the index of the last valid segment
-        last_valid_segment_idx = torch.sum(valid_segments_mask, dim=1) - 1  # [batch_size]
-        
+        last_valid_segment_idx = (
+            torch.sum(valid_segments_mask, dim=1) - 1
+        )  # [batch_size]
+
         # Initialize lists to store start and end positions
         query_positions = []
-        
+
         for i in range(batch_size):
-           
+
             # Get the index of the last valid segment
             last_idx = last_valid_segment_idx[i].item()
-            
+
             # Calculate start position by summing all previous segment sizes
             start_pos = torch.sum(segment_sizes[i, :last_idx]).item()
-            
+
             # Calculate end position by adding the size of the last segment
-            end_pos = start_pos + segment_sizes[i, last_idx].item()      
+            end_pos = start_pos + segment_sizes[i, last_idx].item()
             query_positions.append((start_pos, end_pos))
-            
+
         return query_positions
 
 
-    
 def compute_similarity_matrix(strings):
     """
     Compute a similarity matrix from dissimilarity scores.
-    
+
     Args:
         strings: List of strings
         dissimilarity_func: Function that takes two strings and returns a dissimilarity score
-    
+
     Returns:
         A similarity matrix (kernel matrix)
     """
@@ -773,26 +947,26 @@ def compute_similarity_matrix(strings):
     def hamming_distance(seq1, seq2):
         """
         Calculate the Hamming distance between two DNA sequences.
-        
+
         Args:
             seq1 (str): First DNA sequence
             seq2 (str): Second DNA sequence
-            
+
         Returns:
             int: Hamming distance (number of differing positions)
-            
+
         Raises:
             ValueError: If sequences have different lengths
         """
         if len(seq1) != len(seq2):
             raise ValueError(f"{len(seq1)} and {len(seq2)} are not equal length")
-        
+
         distance = 0
         for i in range(len(seq1)):
             if seq1[i] != seq2[i]:
                 distance += 1
-                
-        return distance 
+
+        return distance
 
     n = len(strings)
     # Initialize similarity matrix
@@ -807,76 +981,78 @@ def compute_similarity_matrix(strings):
                 dissimilarity = levenshtein_distance(strings[i], strings[j])
                 # Use RBF kernel to convert dissimilarity to similarity
                 L[i, j] = np.exp(-dissimilarity)
-    
+
     return L
+
 
 def elementary_symmetric_polynomial(eigenvalues, k):
     """
     Compute elementary symmetric polynomials (e_k) using recursion.
-    
+
     Args:
         eigenvalues: Array of eigenvalues
         k: Size of the subset
-    
+
     Returns:
         Array of e_0, e_1, ..., e_k
     """
     n = len(eigenvalues)
     E = np.zeros((k + 1, n + 1))
     E[0, :] = 1
-    
+
     for l in range(1, k + 1):
         for n_idx in range(1, n + 1):
             E[l, n_idx] = E[l, n_idx - 1] + eigenvalues[n_idx - 1] * E[l - 1, n_idx - 1]
-    
+
     return E[:, n]
+
 
 def sample_kdpp(L, k):
     """
     Sample a subset of size k using k-DPP.
-    
+
     Args:
         L: Similarity matrix (kernel matrix)
         k: Size of the subset to sample
-        
+
     Returns:
         List of indices representing the sampled subset
     """
     n = L.shape[0]
-    
+
     # Compute eigendecomposition of L
     eigenvalues, eigenvectors = np.linalg.eigh(L)
     # Sort eigenvalues in descending order
     idx = np.argsort(eigenvalues)[::-1]
     eigenvalues = eigenvalues[idx]
     eigenvectors = eigenvectors[:, idx]
-    
+
     # Compute elementary symmetric polynomials
     E = elementary_symmetric_polynomial(eigenvalues, k)
-    
+
     # Phase 1: Select k eigenvectors
     selected_indices = []
     remaining = list(range(n))
-    
+
     for i in range(k, 0, -1):
         # Compute probabilities
         probs = np.zeros(len(remaining))
         for j, idx in enumerate(remaining):
             # print(E.shape, eigenvalues.shape, probs.shape)
             # breakpoint()
-            probs[j] = eigenvalues[idx] * E[i-1] / E[i]
-  
+            probs[j] = eigenvalues[idx] * E[i - 1] / E[i]
+
         # Normalize probabilities
         probs = probs / np.sum(probs)
-        
+
         # Sample index
         j = np.random.choice(len(remaining), p=probs)
         selected_indices.append(remaining[j])
         remaining.pop(j)
-    
+
     # Phase 2: Convert from eigenvector indices to item indices
     V = eigenvectors[:, selected_indices]
-    
+
     # Orthonormalize V
     Y = np.zeros((n, k))
     for i in range(k):
@@ -884,46 +1060,47 @@ def sample_kdpp(L, k):
         for j in range(i):
             Y[:, i] = Y[:, i] - np.dot(Y[:, i], Y[:, j]) * Y[:, j]
         Y[:, i] = Y[:, i] / np.linalg.norm(Y[:, i])
-    
+
     # Sample items
     selected_set = set()
     remaining_items = list(range(n))
-    
+
     for i in range(k, 0, -1):
         # Compute probabilities
         probs = np.zeros(len(remaining_items))
         for j, idx in enumerate(remaining_items):
-            probs[j] = np.sum(Y[idx, :i]**2)
-        
+            probs[j] = np.sum(Y[idx, :i] ** 2)
+
         # Normalize probabilities
         probs = probs / np.sum(probs)
-        
+
         # Sample item
         j = np.random.choice(len(remaining_items), p=probs)
         selected_set.add(remaining_items[j])
-        
+
         # Update Y
         e_j = Y[remaining_items[j], :i] / np.linalg.norm(Y[remaining_items[j], :i])
-        Y_new = np.zeros((n, i-1))
-        
+        Y_new = np.zeros((n, i - 1))
+
         for l in range(n):
-            for m in range(i-1):
-                Y_new[l, m] = Y[l, m] - e_j[m] * Y[l, i-1]
-        
+            for m in range(i - 1):
+                Y_new[l, m] = Y[l, m] - e_j[m] * Y[l, i - 1]
+
         Y = Y_new
         remaining_items.pop(j)
-    
+
     return list(selected_set)
+
 
 def kdpp_select_diverse_seqs(sequences, k):
     """
     Select a diverse subset of sequences using k-DPP.
-    
+
     Args:
         strings: List of strings
         dissimilarity_func: Function that takes two strings and returns a dissimilarity score
         k: Size of the subset to select
-        
+
     Returns:
         List of selected strings
     """
@@ -934,13 +1111,14 @@ def kdpp_select_diverse_seqs(sequences, k):
     # Return selected strings
     return [sequences[i] for i in selected_indices]
 
+
 def main():
     parser = argparse.ArgumentParser(description="Train a PromoterModel")
     parser.add_argument(
         "--batch_size", type=int, default=4, help="Batch size for training"
     )
     parser.add_argument(
-        "--num_epochs", type=int, default=10, help="Number of training epochs"
+        "--num_epochs", type=int, default=12, help="Number of training epochs"
     )
     parser.add_argument(
         "--max_len", type=int, default=16000, help="Maximum sequence length"
@@ -948,7 +1126,7 @@ def main():
     parser.add_argument(
         "--initial_learning_rate",
         type=float,
-        default=1e-2,
+        default=1e-4,
         help="Initial learning rate",
     )
     parser.add_argument(
@@ -959,33 +1137,36 @@ def main():
     )
     args = parser.parse_args()
 
-    h =  {
-    'OXKSZ': {'ACAGAGTAACTGC', 'CACGCAAGCGACTA', 'GGGCGGGTAGTACCC'},
-    'GHXGF': {'AAAATGGTCTGTC', 'AATAAGTGAG', 'CGCGACGCCATAGTT'},
-    'XSVNO': {'CCGATCCCGCCCGC', 'GCGGGCCGGCATGCC', 'TTTAGTTGTGTT'},
-    'LPTSW': {'ATTGCTGGACA', 'GCAGTGCCAGTTTC', 'GTCATCGTGCACAT'},
-    'SAPJM': {'AGAGGTACCC', 'CGGGTGAAATT', 'CTGGTCACGAGTT'},
-    'KNGBV': {'AGCACGCACG', 'GAGCGTATCGCAGC'},
-    'YTWYS': {'AATGCAACTGGTT', 'ATGAAATTATT', 'GTACAGACCC'},
-    'IMXVE': {'TAGTGCAACC', 'TGAGACGGACGAT',},
-    'QDKFG': {'CAGGTTTGGCCTGT', 'CCCAGTTACCA', 'GTTTGACTGC'},
-    'GDLYH': {'AACGACAAGCATG', 'TACCCGAGTGTAT', 'TGGGATCTCA'},
-    'XQIRL': {'CACGTGGCGCCGCTT', 'CCGTTTTATTG', 'GTCCTTACATGCCCC'},
-    'BSKUP': {'GAGCCTCTTGCG', 'GAGCGTATCGCAGC'},
+    h = {
+        "OXKSZ": {"ACAGAGTAACTGC", "CACGCAAGCGACTA", "GGGCGGGTAGTACCC"},
+        "GHXGF": {"AAAATGGTCTGTC", "AATAAGTGAG", "CGCGACGCCATAGTT"},
+        "XSVNO": {"CCGATCCCGCCCGC", "GCGGGCCGGCATGCC", "TTTAGTTGTGTT"},
+        "LPTSW": {"ATTGCTGGACA", "GCAGTGCCAGTTTC", "GTCATCGTGCACAT"},
+        "SAPJM": {"AGAGGTACCC", "CGGGTGAAATT", "CTGGTCACGAGTT"},
+        "KNGBV": {"AGCACGCACG", "GAGCGTATCGCAGC"},
+        "YTWYS": {"AATGCAACTGGTT", "ATGAAATTATT", "GTACAGACCC"},
+        "IMXVE": {
+            "TAGTGCAACC",
+            "TGAGACGGACGAT",
+        },
+        "QDKFG": {"CAGGTTTGGCCTGT", "CCCAGTTACCA", "GTTTGACTGC"},
+        "GDLYH": {"AACGACAAGCATG", "TACCCGAGTGTAT", "TGGGATCTCA"},
+        "XQIRL": {"CACGTGGCGCCGCTT", "CCGTTTTATTG", "GTCCTTACATGCCCC"},
+        "BSKUP": {"GAGCCTCTTGCG", "GAGCGTATCGCAGC"},
     }
-    q =  {
-    'OXKSZ': 'ACAGAGTAACTGC' ,
-    'GHXGF': 'AAAATGGTCTGTC',
-    'XSVNO': 'CCGATCCCGCCCGC',
-    'LPTSW': 'ATTGCTGGACA',
-    'SAPJM': 'CTGGTCACGAGTT',
-    'KNGBV': 'CGGGTAGTTGCGAAC',
-    'YTWYS': 'GTACAGACCC',
-    'IMXVE': 'TAGTGCAACC',
-    'QDKFG': 'GTTTGACTGC',
-    'GDLYH': 'TGGGATCTCA',
-    'XQIRL': 'GTCCTTACATGCCCC',
-    'BSKUP': 'TCGACGAATG',
+    q = {
+        "OXKSZ": "ACAGAGTAACTGC",
+        "GHXGF": "AAAATGGTCTGTC",
+        "XSVNO": "CCGATCCCGCCCGC",
+        "LPTSW": "ATTGCTGGACA",
+        "SAPJM": "CTGGTCACGAGTT",
+        "KNGBV": "CGGGTAGTTGCGAAC",
+        "YTWYS": "GTACAGACCC",
+        "IMXVE": "TAGTGCAACC",
+        "QDKFG": "GTTTGACTGC",
+        "GDLYH": "TGGGATCTCA",
+        "XQIRL": "GTCCTTACATGCCCC",
+        "BSKUP": "TCGACGAATG",
     }
 
     with open("data/hits.pkl", "rb") as f:
@@ -993,21 +1174,25 @@ def main():
     with open("data/query.pkl", "rb") as f:
         q = pickle.load(f)
 
-    # example, example_query, val_example, val_query = PromoterDataset.train_validation_split( chr= 19, sequences=example, queries=example_query)
+    '''
+    # some toy data to debug with
+    example, example_query, val_example, val_query = PromoterDataset.train_validation_split( chr= 19, sequences=example, queries=example_query)
+    train_seq, train_query, val_seq, val_query  = PromoterDataset.train_validation_split(19, h, q)
+    '''
 
-    train_seq, train_query, val_seq, val_query  = PromoterDataset._train_validation_split(19, h, q)
-    # train_seq, train_query, val_seq, val_query  = PromoterDataset.train_validation_split(19, h, q)
-
+    train_seq, train_query, val_seq, val_query = (
+        PromoterDataset._train_validation_split(19, h, q)
+    )
 
     alphabet = ATCG(
         mask=True, include_gap=True, include_startstop=True, distinct_startstop=True
     )
 
     model = PromoterModel()
-    
+
     model.initialize_model()
 
-    logger = WandbLogger(project = "poet")
+    logger = WandbLogger(project="poet")
     train_dataset = PromoterDataset(train_seq, train_query, alphabet, args.max_len)
     val_dataset = PromoterDataset(val_seq, val_query, alphabet, args.max_len)
 
@@ -1026,13 +1211,12 @@ def main():
     )
 
     checkpoint_callback = ModelCheckpoint(
-        dirpath='model/',
-        filename='qloss_{epoch}-{val_loss:.2f}-{other_metric:.2f}',
-        save_top_k = -1,
-        every_n_epochs = 1
-
+        dirpath="model/",
+        filename="greedy_with_qloss_{epoch}-{val_loss:.2f}-{other_metric:.2f}",
+        save_top_k=-1,
+        every_n_epochs=2,
     )
-    
+
     trainer = lightning.Trainer(
         max_epochs=args.num_epochs,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
@@ -1044,20 +1228,23 @@ def main():
         precision="bf16",
         # gradient_clip_val=0.5,
         # gradient_clip_algorithm="value"
-        # strategy="ddp",
-        devices=1,
-        val_check_interval=0.5,
-        callbacks=[checkpoint_callback]
+        strategy="ddp",
+        devices=2,
+        val_check_interval=0.25,
+        callbacks=[checkpoint_callback],
     )
     # uniprot = Uniprot21()
     # jit_warmup(model, uniprot)
+
     trainer.fit(
         model,
         train_dataloaders=train_loader,
-        val_dataloaders= val_loader,
+        val_dataloaders=val_loader,
     )
-    trainer.save_checkpoint("0.3_human_random.ckpt")
-   
+    # trainer.save_checkpoint("0.3_human_random.ckpt")
+    with open('logs/train_distribution.pkl', 'wb') as file:
+        pickle.dump(train_dataset.counter, file)
+
 
 if __name__ == "__main__":
     main()

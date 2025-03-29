@@ -18,8 +18,9 @@ from poet.models.poet import PoET
 
 import pickle
 from train import PromoterModel, ATCG, PromoterDataset
-from poet.alphabets import Alphabet, Uniprot21
+from poet.alphabets import Uniprot21
 from poet.models.poet import PoET
+# from metrics import BenchmarkLogger
 
 ASCII_LOWERCASE_BYTES = string.ascii_lowercase.encode()
 PBAR_POSITION = 1
@@ -235,6 +236,8 @@ def main():
     args = parse_args()
     print("-------loading data--------")
 
+    # Benchmarks = BenchmarkLogger('/data' , '/logs')
+
     variants_df = pd.read_csv(args.variants_path)
     wt = variants_df["WT"].to_numpy()
     variants = variants_df["VAR"].to_numpy()
@@ -251,11 +254,12 @@ def main():
     model = model.model
     alphabet = ATCG()
     model = model.cuda().half().eval()
-    dataset = PromoterDataset(hits, {}, alphabet, max_length = 16000 )
+    dataset = PromoterDataset(hits, {}, alphabet, max_length = 16000)
 
     
     # get homologs to score
     print("-------generating prompt--------")
+
     msa_sequences = [
         # np.array(dataset.get_inference_seqs(v, id)) for (id, v) in zip(names, variants)
     ]
@@ -278,7 +282,9 @@ def main():
 
     # score the variants
     logps = []
+
     print("-------scoring variants--------")
+
     torch.cuda.empty_cache()
 
     for i, (w ,var) in tqdm(enumerate(zip(wt, variants)), total=len(wt)):
@@ -313,9 +319,12 @@ def main():
         logps.append(curr_logps)
 
     print("-------saving output--------")
+
     np.save(args.output_npy_path, logps)
     variants_df['POET'] = logps
     variants_df.to_csv('data/scored_eQTL.csv')
+
     print("-------finished--------")
+    
 if __name__ == "__main__":
     main()
