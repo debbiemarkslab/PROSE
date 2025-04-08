@@ -42,8 +42,8 @@ class BenchmarkLogger:
     def _load_datasets(self):
         """Load all benchmark datasets"""
         logger.info("Loading benchmark datasets...")
-        self._load_eqtl_data()
-        self._load_rare_variant_data()
+        # self._load_eqtl_data()
+        # self._load_rare_variant_data()
         self._load_tfbs_data()
         logger.info("All benchmark datasets loaded successfully")
     
@@ -105,7 +105,8 @@ class BenchmarkLogger:
     def _load_tfbs_data(self):
         """Load TFBS disruption benchmark data"""
         # Load the TFBS dataset with consistently and variably expressed genes
-        tfbs_path = os.path.join(self.data_dir, 'tfbs_disruption/tfbs_knockouts.csv')
+        # tfbs_path = os.path.join(self.data_dir, 'tfbs_disruption/tfbs_knockouts.csv')
+        tfbs_path = os.path.join(self.data_dir, 'tfbs_with_expression_types.csv')
         self.tfbs_df = pd.read_csv(tfbs_path)
         
         # Prepare sequences for scoring
@@ -118,8 +119,8 @@ class BenchmarkLogger:
             
         
         logger.info(f"Loaded TFBS dataset with {len(self.tfbs_df)} variants")
-        logger.info(f"  Consistently expressed: {len(self.tfbs_df[self.tfbs_df['expression_type'] == 'consistent'])}")
-        logger.info(f"  Variably expressed: {len(self.tfbs_df[self.tfbs_df['expression_type'] == 'variable'])}")
+        logger.info(f"  Consistently expressed: {len(self.tfbs_df[self.tfbs_df['expression'] == 'consistent'])}")
+        logger.info(f"  Variably expressed: {len(self.tfbs_df[self.tfbs_df['expression'] == 'variable'])}")
     
     
     def _calculate_cohens_d(self, x, y):
@@ -228,6 +229,8 @@ class BenchmarkLogger:
         
         # Add scores to DataFrame
         self.rare_df['ProSE_avg_score'] = scores
+        self.rare_df.dropna(inplace=True)
+
         # self.rare_df['ProSE_forward_score'] = [score[1] for score in scores]
         
         # Calculate enrichment for multiple percentile thresholds
@@ -267,12 +270,10 @@ class BenchmarkLogger:
         """
         logger.info("Scoring TFBS benchmark...")
         
-    
-        
         # Add scores to DataFrame
         self.tfbs_df['ProSE_avg_score'] = scores
         # self.tfbs_df['ProSE_forward_score'] = [score[1] for score in scores]
-        
+        self.tfbs_df.dropna(inplace=True)
         # Group by TF and calculate accuracy for each
         delta_accuracies = []
         
@@ -284,8 +285,8 @@ class BenchmarkLogger:
             if len(tf_data) < 2:
                 continue
             
-            consistent_scores = tf_data[tf_data['expression_type'] == 'consistent']['ProSE_avg_score']
-            variable_scores = tf_data[tf_data['expression_type'] == 'variable']['ProSE_avg_score']
+            consistent_scores = tf_data[tf_data['expression'] == 'consistent']['ProSE_avg_score']
+            variable_scores = tf_data[tf_data['expression'] == 'variable']['ProSE_avg_score']
             
             # Skip if not enough data in either group
             if len(consistent_scores) == 0 or len(variable_scores) == 0:

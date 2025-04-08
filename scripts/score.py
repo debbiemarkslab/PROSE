@@ -153,8 +153,8 @@ def _get_logps_tiered_fast(
             )
         assert (this_variants == alphabet.gap_token).sum() == 0
         this_variants = this_variants.cuda()
-        print(this_variants.shape)
-        breakpoint()
+        # print(this_variants.shape)
+        # breakpoint()
         logits = model.logits(this_variants[:, :-1], memory, preallocated_memory=True)
         targets = this_variants[:, 1:]
         score = -criteria.forward(logits.transpose(1, 2), targets).float().sum(dim=1)
