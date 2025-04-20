@@ -22,9 +22,7 @@ from poet.alphabets import Uniprot21
 ASCII_LOWERCASE_BYTES = string.ascii_lowercase.encode()
 PBAR_POSITION = 1
 
-
 T = TypeVar("T", np.ndarray, torch.Tensor)
-
 
 def append_startstop(x: T, alphabet: Uniprot21) -> T:
     x_ndim = x.ndim
@@ -106,23 +104,19 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt_path", 
                         type=str, 
-                        default="/n/groups/marks/users/erik/Promoter_Poet_private/model/1e-3_lr_reversed_random_no_dropout_small_epoch=11-val_loss=0.00-other_metric=0.00.ckpt")
-
-    parser.add_argument("--output_csv_path",
-                        type=str,
-                        default="data/reversed_sampled_seqs_greedy.csv",
-    )
+                        default="/n/groups/marks/users/erik/Promoter_Poet_private/model/sanity_0.1_human_small_random_0.1_dropout_small_epoch=10.ckpt")
 
     parser.add_argument("--batch_size", 
                         type=int, 
                         default=8)
+    
     parser.add_argument("--seed", 
                         type=int, 
                         default=188257)
  
     parser.add_argument("--hits_path",
                         type=str,
-                        default="data/hits.pkl"
+                        default="data/random.pkl"
     )
     
     args = parser.parse_args()
@@ -136,31 +130,23 @@ def main():
     with open(args.hits_path, "rb") as f:
         hits = pickle.load(f)
 
-    names = [i for i in hits.keys() if i.endswith('_chr19')]
+    # names = [i for i in hits.keys() if i.endswith('_chr19')]
    
     print("-------loading model--------")
 
-    model = PromoterModel()
-    model.load_from_checkpoint(args.ckpt_path)
+        # model = PromoterModel()
+    model = PromoterModel.load_from_checkpoint(args.ckpt_path)  # Class method
+
+    # model.load_from_checkpoint(args.ckpt_path)
     model = model.model
     alphabet = ATCG()
     model = model.cuda().eval()
-    dataset = PromoterDataset(sequences = hits, 
-                              queries = {}, 
-                              alphabet = alphabet, 
-                              max_length = 64000)
+  
     
     # get homologs to score
     print("-------generating prompt--------")
 
-    msa_sequences = [
-        # np.array(dataset.get_inference_seqs(v, id)) for (id, v) in zip(names, variants)
-    ]
-
-    for id in tqdm(names, total=len(names)):
-        curr = np.array(dataset.get_inference_seqs(variant = "", id = id))
-        
-        msa_sequences.append(curr)
+    msa_sequences = [[i]*32 for i in hits]
 
     print("-------generating sequences--------")
     all_samples = []
@@ -169,10 +155,12 @@ def main():
     torch.cuda.empty_cache()
 
     with torch.cuda.amp.autocast():
-        for prompt, _ in tqdm(zip(msa_sequences, names), total=len(names)):
+        for i, prompt in tqdm(enumerate(msa_sequences), total=len(msa_sequences)):
             prompt = get_encoded_msa_from_a3m_seqs(msa_sequences=prompt, alphabet=alphabet)
             samples, scores = get_sample_fast(prompt, model, args.batch_size, alphabet)
             # print(samples)
+            print("prompt", hits[i])
+            print(samples[0])
             all_samples.append(samples)
             all_scores.append(scores)
 

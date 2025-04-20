@@ -14,6 +14,7 @@ import pandas as pd
 from poet.alphabets import Uniprot21
 from poet.models.modules.packed_sequence import PackedTensorSequences
 from poet.models.poet import PoET
+from poet.fasta import parse_stream
 
 import pickle
 from train import PromoterModel, ATCG, PromoterDataset
@@ -49,10 +50,58 @@ def get_encoded_msa_from_a3m_seqs(
     msa_sequences: list[bytes], alphabet: Uniprot21
 ) -> List:
     return [
-            append_startstop(alphabet.encode(s.encode("ascii")
+            append_startstop(alphabet.encode(s.encode('utf-8')
                                              .translate(None, delete=ASCII_LOWERCASE_BYTES)), 
                                              alphabet)
             for s in msa_sequences ]
+
+
+def get_seqs_from_fastalike(filepath: Path) -> list[bytes]:
+    return [s for _, s in parse_stream(open(filepath, "rb"), upper=False)]
+
+
+
+def sample_msa_sequences(
+    get_sequence_fn: Callable[[int], bytes],
+    sample_idxs: Sequence[int],
+    max_tokens: int,
+    alphabet: Uniprot21,
+    shuffle: bool = True,
+    shuffle_seed: Optional[int] = None,
+    truncate: bool = True,
+) -> list[np.ndarray]:
+    assert alphabet.start_token != -1
+    assert alphabet.stop_token != -1
+    if not shuffle:
+        assert shuffle_seed is None
+
+    seqs, total_tokens = [], 0
+    for idx in sample_idxs:
+        next_sequence = get_sequence_fn(idx)
+        seqs.append(append_startstop(alphabet.encode(next_sequence), alphabet=alphabet))
+        total_tokens += len(seqs[-1])
+        if total_tokens > max_tokens:
+            break
+
+    # shuffle order and truncate to max tokens
+    if shuffle:
+        rng = (
+            np.random.default_rng(shuffle_seed)
+            if shuffle_seed is not None
+            else np.random
+        )
+        final_permutation = rng.permutation(len(seqs))
+    else:
+        final_permutation = np.arange(len(seqs))
+    final_seqs, total_tokens = [], 0
+    for seq in [seqs[i] for i in final_permutation]:
+        if truncate and (total_tokens + len(seq) > max_tokens):
+            seq = seq[: max_tokens - total_tokens]
+        total_tokens += len(seq)
+        final_seqs.append(seq)
+        if total_tokens >= max_tokens:
+            break
+    return final_seqs
 
 
 def _get_sample_fast(
@@ -62,11 +111,11 @@ def _get_sample_fast(
     alphabet: Uniprot21,
 ) -> np.ndarray:
     
-    sample_xs, sample_scores = model.min_sample_given_memory(memory = memory, 
-                                                         temperature = 1.5, # try changing it
+    sample_xs, sample_scores = model.sample_given_memory(memory = memory, 
+                                                         temperature = 1, # try changing it
                                                          top_k = None,
                                                          top_p = None,
-                                                        #  minlen = 500, 
+                                                         minlen = 500, 
                                                          maxlen = 1000,
                                                          alphabet = alphabet,
                                                          batch_size = batch_size)
@@ -86,7 +135,7 @@ def get_sample_fast(
         msa_sequences: torch.Tensor = torch.cat(
             [torch.from_numpy(s).long() for s in msa_sequences]
         ).cuda()
-
+      
         memory = model.embed(
             msa_sequences.unsqueeze(0),
             segment_sizes.unsqueeze(0),
@@ -106,16 +155,16 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt_path", 
                         type=str, 
-                        default="/n/groups/marks/users/erik/Promoter_Poet_private/model/1e-3_lr_reversed_random_no_dropout_small_epoch=11-val_loss=0.00-other_metric=0.00.ckpt")
+                        default="/n/groups/marks/users/erik/Promoter_Poet_private/data/poet.ckpt")
 
     parser.add_argument("--output_csv_path",
                         type=str,
-                        default="data/reversed_sampled_seqs_greedy.csv",
+                        default="data/sampled_seqs_greedy.csv",
     )
 
     parser.add_argument("--batch_size", 
                         type=int, 
-                        default=8)
+                        default=16)
     parser.add_argument("--seed", 
                         type=int, 
                         default=188257)
@@ -131,38 +180,26 @@ def parse_args():
 
 def main():
     args = parse_args()
-    print("-------loading data--------")
 
-    with open(args.hits_path, "rb") as f:
-        hits = pickle.load(f)
+    # load model
+    ckpt = torch.load(args.ckpt_path)
+    model = PoET(**ckpt["hyper_parameters"]["model_spec"]["init_args"])
+    model.load_state_dict(
+        {k.split(".", 1)[1]: v for k, v in ckpt["state_dict"].items()}
+    )
+    del ckpt
+    model = model.cuda().half().eval()
+    alphabet = Uniprot21(
+        include_gap=True, include_startstop=True, distinct_startstop=True
+    )
 
-    names = [i for i in hits.keys() if i.endswith('_chr19')]
-   
-    print("-------loading model--------")
-
-    model = PromoterModel()
-    model.load_from_checkpoint(args.ckpt_path)
-    model = model.model
-    alphabet = ATCG()
-    model = model.cuda().eval()
-    dataset = PromoterDataset(sequences = hits, 
-                              queries = {}, 
-                              alphabet = alphabet, 
-                              max_length = 64000)
-    
-    # get homologs to score
-    print("-------generating prompt--------")
-
+    # process msa
+    msa_sequences = get_seqs_from_fastalike(args.msa_a3m_path)
+    msa = get_encoded_msa_from_a3m_seqs(msa_sequences=msa_sequences, alphabet=alphabet)
     msa_sequences = [
         # np.array(dataset.get_inference_seqs(v, id)) for (id, v) in zip(names, variants)
     ]
 
-    for id in tqdm(names, total=len(names)):
-        curr = np.array(dataset.get_inference_seqs(variant = "", id = id))
-        
-        msa_sequences.append(curr)
-
-    print("-------generating sequences--------")
     all_samples = []
     all_scores = []
 
@@ -172,7 +209,6 @@ def main():
         for prompt, _ in tqdm(zip(msa_sequences, names), total=len(names)):
             prompt = get_encoded_msa_from_a3m_seqs(msa_sequences=prompt, alphabet=alphabet)
             samples, scores = get_sample_fast(prompt, model, args.batch_size, alphabet)
-            # print(samples)
             all_samples.append(samples)
             all_scores.append(scores)
 
@@ -182,7 +218,7 @@ def main():
     df['GENE'] = names
     df['samples'] = all_samples
     df['scores'] = all_scores
-    df.to_csv("data/hightemp_reversed_generated_promoters.csv")
+    df.to_csv("data/generated_promoters.csv")
     print("-------finished-------")
     
 if __name__ == "__main__":

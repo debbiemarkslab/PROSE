@@ -923,9 +923,169 @@ class PoET(nn.Module, LogitsAllocateMemoryMixin):
             remove_invalid=remove_invalid,
             batch_size=batch_size,
         )
-
+    
     @torch.inference_mode()
     def sample_given_memory(
+        self,
+        memory: Optional[list[PackedTensorSequences]],
+        temperature: float = 1,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        maxlen: int = 1000,
+        alphabet: Uniprot21 = Uniprot21(
+            include_gap=True, include_startstop=True, distinct_startstop=True
+        ),
+        remove_invalid: bool = True,
+        batch_size: int = 1,
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        """Sample batch_size sequences from memory.
+
+        Assumes memory represents one prompt, and samples each sequence from that one
+        prompt.
+
+        Note: this implementation is out of date
+
+        Args:
+          memory:
+            Output of self.embed
+            Must only describe one sequence of sequences i.e. have a batch size of 1
+          temperature:
+            Controls the randomness of the sampling by dividing the logits
+          top_k:
+            Controls the number of most probable tokens to consider at each step of
+            sampling
+            Default is None, which means all tokens are considered
+          top_p:
+            Controls the cumulative probability of the most probable tokens to consider
+            at each step of sampling as in nucleus sampling
+            Default is None, which is equivalent to the behavior with top_p=1
+          maxlen:
+            Maximum sequence length to sample, not including start and stop tokens
+            Thus, returned sequences with have length up to maxlen+2, where the first
+            token is the start token, and the last token is the stop token if the
+            sequence terminates within maxlen tokens.
+          alphabet:
+            The alphabet encoding the sequence.
+          remove_invalid:
+            Whether or not to avoid sampling non-amino acids within a sequence.
+          batch_size:
+            Number of sequences to sample in parallel
+
+        Returns:
+          A tuple (sample_xs, sample_scores), where sample_xs is a list containing the
+          sampled sequences as tensors encoded by alphabet, and sample_scores is a
+          tensor containing the negative log likelihood of each sampled sequence.
+        """
+        criteria = nn.CrossEntropyLoss(
+            ignore_index=alphabet.mask_token, reduction="none"
+        )
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        invalid_tokens = torch.tensor(
+            [alphabet.mask_token, alphabet.start_token, alphabet.gap_token],
+            device=device,
+        )
+        nhead = self.decoder.layers[0].num_heads
+        head_dim = self.decoder.layers[0].dim // nhead
+
+        # initialize memory buffer
+        buffer_size = (batch_size, maxlen + 2, nhead, head_dim)
+        self_buffer = [
+            torch.empty(buffer_size, device=device, dtype=dtype)
+            for _ in range(2 * len(self.decoder.layers))
+        ]
+        buffer = [
+            torch.empty(buffer_size, device=device, dtype=dtype)
+            for _ in range(2 * len(self.decoder.layers))
+        ]
+
+        # initialize x
+        current_token = (
+            torch.ones((batch_size, 1), dtype=torch.long, device=device)
+            * alphabet.start_token
+        )
+        current_x = current_token
+        current_position = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
+        current_position_int = 0
+        current_logits: Optional[torch.Tensor] = None
+
+        # sample rest of x
+        sampled_xs, sampled_scores = [], []
+        while True:
+            # get logits for current x
+            x: PackedTensorSequences = PackedTensorSequences.pack_input(
+                current_token.unsqueeze(2),
+                positions=current_position,
+            )
+            x.x = self.token_embed.forward(x.x.squeeze(1))
+            x = _apply_causal_prefix_attention_buffered(
+                decoder=self.decoder,
+                x=x,
+                memory=memory,
+                self_buffer=[buf[:, : current_position_int + 1] for buf in self_buffer],
+                buffer=[buf[:, : current_position_int + 1] for buf in buffer],
+            )
+            embeddings = self.norm(x.x)
+            logits = self.linear.forward(embeddings).unsqueeze(1)
+
+            # sample the next token
+            next_token_logits = logits[:, -1].log_softmax(dim=1)
+            if remove_invalid:
+                next_token_logits[:, invalid_tokens] += -torch.inf
+            next_token_logits /= temperature
+            next_token_logits = top_k_top_p_filtering(
+                next_token_logits, top_k=top_k, top_p=top_p
+            )
+            next_token = torch.multinomial(
+                next_token_logits.float().softmax(dim=-1), 1
+            ).flatten()
+
+            # update state
+            current_token = next_token.unsqueeze(1)
+            current_x = torch.cat([current_x, current_token], dim=1)
+            current_position = current_position + 1
+            current_position_int += 1
+            if current_logits is None:
+                current_logits = logits
+            else:
+                current_logits = torch.cat([current_logits, logits], dim=1)
+
+            # apply sampling termination conditions
+            is_stop_batch_filter = (
+                (next_token == alphabet.stop_token)
+                if current_x.size(1) < maxlen + 2
+                else torch.ones((current_x.size(0),), dtype=torch.bool, device=device)
+            )
+            if is_stop_batch_filter.sum() > 0:
+                is_stop_batch_idxs = torch.where(is_stop_batch_filter)[0]
+                not_is_stop_batch_idxs = torch.where(~is_stop_batch_filter)[0]
+
+                sampled_xs.extend(current_x[is_stop_batch_idxs].unbind())
+                sampled_scores.append(
+                    -criteria.forward(
+                        current_logits[is_stop_batch_idxs].transpose(1, 2),
+                        current_x[is_stop_batch_idxs, 1:].cuda(),
+                    )
+                    .float()
+                    .sum(dim=1)
+                )
+                if is_stop_batch_idxs.numel() == current_x.size(0):
+                    break
+                else:
+                    # remove terminated sequences from state
+                    _filter = not_is_stop_batch_idxs
+                    current_token = current_token[_filter]
+                    current_x = current_x[_filter]
+                    current_position = current_position[_filter]
+                    current_logits = current_logits[_filter]
+                    for idx in range(len(self_buffer)):
+                        self_buffer[idx] = self_buffer[idx][_filter]
+                    for idx in range(len(buffer)):
+                        buffer[idx] = buffer[idx][_filter]
+        return sampled_xs, torch.hstack(sampled_scores)
+    
+    @torch.inference_mode()
+    def min_sample_given_memory(
         self,
         memory: Optional[list[PackedTensorSequences]],
         temperature: float = 1,
