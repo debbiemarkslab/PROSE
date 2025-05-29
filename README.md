@@ -21,4 +21,4 @@ slurm script that works with both: `score.sh`
 
 relevant args: `--output_csv_path`, `--batch_size` (# seqs generated per prompt), `--ckpt_path`, `--temp`
 ## Evaluation
-`scripts\notebook.ipynb`
+everything in `scripts\notebook.ipynb`
