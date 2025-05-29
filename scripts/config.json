@@ -1,7 +1,7 @@
 { 
     "model": 
     {
-        "n_vocab": 24,
+        "n_vocab": 8,
         "hidden_dim": 1024,
         "num_layers": 12,
         "nhead": 16,

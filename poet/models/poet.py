@@ -931,50 +931,51 @@ class PoET(nn.Module, LogitsAllocateMemoryMixin):
         temperature: float = 1,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
-        maxlen: int = 1000,
+        minlen: int = 1000,  # New parameter for minimum sequence length
+        maxlen: int = 2000,  # Increased from 1000 to allow longer sequences
         alphabet: Uniprot21 = Uniprot21(
             include_gap=True, include_startstop=True, distinct_startstop=True
         ),
         remove_invalid: bool = True,
         batch_size: int = 1,
     ) -> tuple[list[torch.Tensor], torch.Tensor]:
-        """Sample batch_size sequences from memory.
+        """Sample batch_size sequences from memory, ensuring sequences are longer than minlen.
 
         Assumes memory represents one prompt, and samples each sequence from that one
         prompt.
 
-        Note: this implementation is out of date
-
         Args:
-          memory:
+        memory:
             Output of self.embed
             Must only describe one sequence of sequences i.e. have a batch size of 1
-          temperature:
+        temperature:
             Controls the randomness of the sampling by dividing the logits
-          top_k:
+        top_k:
             Controls the number of most probable tokens to consider at each step of
             sampling
             Default is None, which means all tokens are considered
-          top_p:
+        top_p:
             Controls the cumulative probability of the most probable tokens to consider
             at each step of sampling as in nucleus sampling
             Default is None, which is equivalent to the behavior with top_p=1
-          maxlen:
+        minlen:
+            Minimum sequence length to sample, not including start and stop tokens
+        maxlen:
             Maximum sequence length to sample, not including start and stop tokens
             Thus, returned sequences with have length up to maxlen+2, where the first
             token is the start token, and the last token is the stop token if the
             sequence terminates within maxlen tokens.
-          alphabet:
+        alphabet:
             The alphabet encoding the sequence.
-          remove_invalid:
+        remove_invalid:
             Whether or not to avoid sampling non-amino acids within a sequence.
-          batch_size:
+        batch_size:
             Number of sequences to sample in parallel
 
         Returns:
-          A tuple (sample_xs, sample_scores), where sample_xs is a list containing the
-          sampled sequences as tensors encoded by alphabet, and sample_scores is a
-          tensor containing the negative log likelihood of each sampled sequence.
+        A tuple (sample_xs, sample_scores), where sample_xs is a list containing the
+        sampled sequences as tensors encoded by alphabet, and sample_scores is a
+        tensor containing the negative log likelihood of each sampled sequence.
         """
         criteria = nn.CrossEntropyLoss(
             ignore_index=alphabet.mask_token, reduction="none"
@@ -1032,6 +1033,12 @@ class PoET(nn.Module, LogitsAllocateMemoryMixin):
             next_token_logits = logits[:, -1].log_softmax(dim=1)
             if remove_invalid:
                 next_token_logits[:, invalid_tokens] += -torch.inf
+
+            # If current sequence is shorter than minlen, prevent stop token from being sampled
+            # by setting its probability to -inf
+            if current_position_int < minlen:
+                next_token_logits[:, alphabet.stop_token] = -torch.inf
+            
             next_token_logits /= temperature
             next_token_logits = top_k_top_p_filtering(
                 next_token_logits, top_k=top_k, top_p=top_p
@@ -1050,12 +1057,17 @@ class PoET(nn.Module, LogitsAllocateMemoryMixin):
             else:
                 current_logits = torch.cat([current_logits, logits], dim=1)
 
-            # apply sampling termination conditions
+            # apply sampling termination conditions - only consider stop tokens if sequence is at least minlen
             is_stop_batch_filter = (
-                (next_token == alphabet.stop_token)
+                (next_token == alphabet.stop_token) & (current_position_int > minlen)
                 if current_x.size(1) < maxlen + 2
                 else torch.ones((current_x.size(0),), dtype=torch.bool, device=device)
             )
+            
+            # Force stopping at maxlen regardless of minlen requirement
+            if current_position_int >= maxlen:
+                is_stop_batch_filter = torch.ones((current_x.size(0),), dtype=torch.bool, device=device)
+                
             if is_stop_batch_filter.sum() > 0:
                 is_stop_batch_idxs = torch.where(is_stop_batch_filter)[0]
                 not_is_stop_batch_idxs = torch.where(~is_stop_batch_filter)[0]
@@ -1082,6 +1094,7 @@ class PoET(nn.Module, LogitsAllocateMemoryMixin):
                         self_buffer[idx] = self_buffer[idx][_filter]
                     for idx in range(len(buffer)):
                         buffer[idx] = buffer[idx][_filter]
+        
         return sampled_xs, torch.hstack(sampled_scores)
 
     @torch.inference_mode()

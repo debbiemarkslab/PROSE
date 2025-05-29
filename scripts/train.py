@@ -17,7 +17,7 @@ from lightning.pytorch.utilities.grads import grad_norm
 from lightning.pytorch.callbacks import ModelCheckpoint
 import math
 from collections import defaultdict
-from Levenshtein import distance as levenshtein_distance
+# from Levenshtein import distance as levenshtein_distance
 
 IGNORE_INDEX = -100
 
@@ -84,7 +84,7 @@ class PromoterDataset(Dataset):
         id = np.random.choice(self.ids, p=self.sampling_weights)
         self.counter[id] += 1
 
-        sampled_set = self.greedy_sample_and_fit_sequences(
+        sampled_set = self.sample_and_fit_sequences(
             id,
             max_seq_length=self.max_len,
         )
@@ -94,7 +94,7 @@ class PromoterDataset(Dataset):
 
     def get_inference_seqs(self, variant: str, id: str):
         try:
-            sampled_set = self.greedy_sample_and_fit_sequences(
+            sampled_set = self.sample_and_fit_sequences(
                 id, sequence=variant, max_seq_length=self.max_len
             )
 
@@ -121,94 +121,94 @@ class PromoterDataset(Dataset):
         else:
             return np.random.choice(self.sequences[id])
 
-    def diverse_sample_and_fit_sequences(
-        self,
-        query_id_or_sequence: Optional[
-            str
-        ] = None,  # Changed parameter name to be more explicit
-        max_seq_length: int = 1024,
-        include_query: bool = True,
-        p_human: float = 0.3,
-        sequence=None,
-    ) -> Dict[str, Any]:
-        """
-        MCMC algorithm to stochastically sample a diverse subset, 
-        with temperature and iteration hyperparameters to control mixing time
-        """
-        if sequence is None:
-            query_sequence = self.sample_query(
-                query_id_or_sequence, p_human
-            )  # P(human sequence) = 0.3
-        else:
-            query_sequence = sequence
+    # def diverse_sample_and_fit_sequences(
+    #     self,
+    #     query_id_or_sequence: Optional[
+    #         str
+    #     ] = None,  # Changed parameter name to be more explicit
+    #     max_seq_length: int = 1024,
+    #     include_query: bool = True,
+    #     p_human: float = 0.3,
+    #     sequence=None,
+    # ) -> Dict[str, Any]:
+    #     """
+    #     MCMC algorithm to stochastically sample a diverse subset, 
+    #     with temperature and iteration hyperparameters to control mixing time
+    #     """
+    #     if sequence is None:
+    #         query_sequence = self.sample_query(
+    #             query_id_or_sequence, p_human
+    #         )  # P(human sequence) = 0.3
+    #     else:
+    #         query_sequence = sequence
 
-        query_length = (
-            len(query_sequence) + self.num_special_characters
-            if query_sequence
-            else None
-        )
+    #     query_length = (
+    #         len(query_sequence) + self.num_special_characters
+    #         if query_sequence
+    #         else None
+    #     )
 
-        # Calculate effective length for passages
-        effective_length = max_seq_length - (
-            query_length if query_length is not None else 0
-        )
+    #     # Calculate effective length for passages
+    #     effective_length = max_seq_length - (
+    #         query_length if query_length is not None else 0
+    #     )
 
-        total_tokens = query_length if query_length is not None else 0
-        leftover = effective_length
+    #     total_tokens = query_length if query_length is not None else 0
+    #     leftover = effective_length
 
-        max_iters = 200
-        beta = 0.2
-        rounds = 0
-        S = {}
-        score = 0
+    #     max_iters = 200
+    #     beta = 0.2
+    #     rounds = 0
+    #     S = {}
+    #     score = 0
 
-        while leftover > 0 and rounds < max_iters:
-            rounds += 1
-            if random.random() < 0.5:
-                # Uniformly randomly select an element from V
-                s = random.choice(self.sequences[query_id_or_sequence])
-                if s not in S:
-                    # Attempt to add s
-                    new_score = 0
-                    for t in S.keys():
-                        new_score += levenshtein_distance(t, s) / max(len(t), len(s))
-                    new_score /= (len(S) + 1) ** 2
+    #     while leftover > 0 and rounds < max_iters:
+    #         rounds += 1
+    #         if random.random() < 0.5:
+    #             # Uniformly randomly select an element from V
+    #             s = random.choice(self.sequences[query_id_or_sequence])
+    #             if s not in S:
+    #                 # Attempt to add s
+    #                 new_score = 0
+    #                 for t in S.keys():
+    #                     new_score += levenshtein_distance(t, s) / max(len(t), len(s))
+    #                 new_score /= (len(S) + 1) ** 2
 
-                    p_add = math.exp(beta * (score + new_score)) / (
-                        math.exp(beta * score) + math.exp(beta * (score + new_score))
-                    )
-                    if random.random() < p_add:
-                        S[s] = len(s)
-                        l = len(s) + self.num_special_characters
-                        score += new_score
-                        leftover -= l
-                        total_tokens += l
+    #                 p_add = math.exp(beta * (score + new_score)) / (
+    #                     math.exp(beta * score) + math.exp(beta * (score + new_score))
+    #                 )
+    #                 if random.random() < p_add:
+    #                     S[s] = len(s)
+    #                     l = len(s) + self.num_special_characters
+    #                     score += new_score
+    #                     leftover -= l
+    #                     total_tokens += l
 
-                elif s in S:
-                    # Attempt to delete s
-                    new_score = 0
-                    for t in S.keys():
-                        new_score += levenshtein_distance(t, s) / max(len(t), len(s))
-                    new_score /= (len(S) + 1) ** 2
-                    p_delete = math.exp(beta * (score - new_score)) / (
-                        math.exp(beta * score) + math.exp(beta * (score - new_score))
-                    )
-                    if random.random() < p_delete:
-                        del S[s]
-                        l = len(s) + self.num_special_characters
-                        leftover += l
-                        total_tokens -= l
-                        score -= new_score
+    #             elif s in S:
+    #                 # Attempt to delete s
+    #                 new_score = 0
+    #                 for t in S.keys():
+    #                     new_score += levenshtein_distance(t, s) / max(len(t), len(s))
+    #                 new_score /= (len(S) + 1) ** 2
+    #                 p_delete = math.exp(beta * (score - new_score)) / (
+    #                     math.exp(beta * score) + math.exp(beta * (score - new_score))
+    #                 )
+    #                 if random.random() < p_delete:
+    #                     del S[s]
+    #                     l = len(s) + self.num_special_characters
+    #                     leftover += l
+    #                     total_tokens -= l
+    #                     score -= new_score
 
-        #
-        return {
-            "id": query_id_or_sequence if include_query else None,
-            "sequence": query_sequence,
-            "passages": list(S.keys()),
-            "passage_lengths": list(S.values()),
-            "query_length": query_length,
-            "total_tokens": total_tokens,
-        }
+    #     #
+    #     return {
+    #         "id": query_id_or_sequence if include_query else None,
+    #         "sequence": query_sequence,
+    #         "passages": list(S.keys()),
+    #         "passage_lengths": list(S.values()),
+    #         "query_length": query_length,
+    #         "total_tokens": total_tokens,
+    #     }
 
     def sample_and_fit_sequences(
         self,
@@ -372,7 +372,7 @@ class PromoterDataset(Dataset):
             query_sequence = sequence
         else:
             query_sequence = self.sample_query(
-                query_id_or_sequence, p_human )  # P(human sequence) = 0.3
+                query_id_or_sequence, p_human)  # P(human sequence) = 0.3
 
         # Apply individual sequence length limit if specified
         if max_individual_seq_length and query_sequence:
@@ -572,10 +572,10 @@ class PromoterDataset(Dataset):
             tokens = torch.cat([tokens, padding])
 
         # Create labels (same as tokens but with padding masked)
-
         return {
             "tokens": tokens,
             "seq_lens": all_lengths,
+            "labels": tokens.clone()
         }
 
     def padded_collate_packed(
@@ -619,14 +619,19 @@ class PromoterDataset(Dataset):
             raise ValueError("Unknown pad_mode. Use 'largest', 'fixed', or None.")
 
         padded_tokens = []
+        padded_labels = []
 
         for x in batch:
             token = x["tokens"]
+            label = x["labels"]
             pad_len = target_length - token.size(0)
             if pad_len > 0:
                 token = F.pad(token, (0, pad_len), value=padding_idx)
+                label = F.pad(label, (0, pad_len), value=padding_idx)
+            padded_labels.append(label)
             padded_tokens.append(token)
         tokens_tensor = torch.stack(padded_tokens, dim=0)
+        labels_tensor = torch.stack(padded_labels, dim=0)
 
         # Collate segment sizes (each sample may have several segments).
         max_segments = max(len(x["seq_lens"]) for x in batch)
@@ -639,6 +644,7 @@ class PromoterDataset(Dataset):
         collated_batch = {
             "tokens": tokens_tensor,
             "segment_sizes": segment_sizes,
+            "labels": labels_tensor,
         }
 
         collated_batch = self._to_cuda(collated_batch)
@@ -685,74 +691,29 @@ class PromoterDataset(Dataset):
         return train_seq, train_query, val_seq, val_query
 
 
-def jit_warmup(embedding_model: PoET, alphabet: Uniprot21):
-    x = b"$WAAAGH*$WAAGW*"
-    segment_sizes = [8, 7]
-    x = alphabet.encode(x)  # encode x into the uniprot21 alphabet
-    x = torch.from_numpy(x).long().cuda()
-    segment_sizes = torch.tensor(segment_sizes).long().cuda()
-    x = embedding_model(x.unsqueeze(0), segment_sizes.unsqueeze(0))
-    print("warmup", x)
-
-
-class SqrtDecayScheduler(torch.optim.lr_scheduler._LRScheduler):
-    """
-    Used in original PoET Training
-    """
-
-    def __init__(
-        self,
-        optimizer,
-        last_epoch: int = -1,
-        verbose: bool = False,
-        scaling_factor: float = 1.0,
-        offset: int = 0,
-    ):
-
-        self.scaling_factor = scaling_factor
-        self.offset = offset
-        super().__init__(optimizer, last_epoch, verbose)
-
-    def get_lr(self) -> list[float]:
-        """Compute scaled learning rate using sqrt decay"""
-        return [
-            base_lr * self.scaling_factor / math.sqrt(self.last_epoch + 1 + self.offset)
-            for base_lr in self.base_lrs
-        ]
-
-    def theoretical_bound(self, total_steps: int, gradient_bound: float) -> float:
-        """
-        Theoretical convergence bound for convex functions with L-Lipschitz gradients:
-
-        f(x̄_T) - f(x^*) ≤ (2D²L + D√(2σ²T)) / √T
-
-        Where:
-        - D: Diameter of feasible set
-        - L: Lipschitz constant
-        - σ²: Gradient variance bound
-        - T: Total number of steps
-
-        Returns expected optimization error bound
-        """
-        return (
-            2 * self.scaling_factor**2 * gradient_bound**2
-            + self.scaling_factor * math.sqrt(2 * gradient_bound**2 * total_steps)
-        ) / torch.sqrt(total_steps)
-
-
 class PromoterModel(lightning.LightningModule):
     def __init__(self):
         super().__init__()
         # ckpt = torch.load(ckpt_path)
         init = {
-            "n_vocab": 24,
-            "hidden_dim": 1024,
-            "num_layers": 12,
-            "nhead": 16,
+            "n_vocab": 8,
+            "hidden_dim": 768,
+            "num_layers": 6,
+            "nhead": 12,
             "dropout": 0,
             "use_multi_rotary": True,
             "norm": True,
         }
+
+        # init = {
+        # "n_vocab": 8,
+        # "hidden_dim": 1024,
+        # "num_layers": 12,
+        # "nhead": 16,
+        # "dropout": 0,
+        # "use_multi_rotary": True,
+        # "norm": True
+        # }, 
         self.model = PoET(**init).cuda()
 
     def forward(self, xs: torch.Tensor, segment_sizes: torch.Tensor) -> torch.Tensor:
@@ -765,10 +726,11 @@ class PromoterModel(lightning.LightningModule):
     def training_step(self, batch, batch_idx):
         xs = batch["tokens"]
         segment_sizes = batch["segment_sizes"]
+        label = batch["labels"]
         logits = self.model(xs, segment_sizes)
 
         # Calculate loss (next token prediction)
-        targets = xs[:, 1:].contiguous()  # Shift targets by 1
+        targets = label[:, 1:].contiguous()  # Shift targets by 1
         logits = logits[:, :-1, :].contiguous()  # Remove last logit
 
         query_positions = self.compute_last_segment_positions(segment_sizes)
@@ -804,10 +766,12 @@ class PromoterModel(lightning.LightningModule):
     def validation_step(self, batch, batch_idx):
         xs = batch["tokens"]
         segment_sizes = batch["segment_sizes"]
+        label = batch["labels"]
+
         logits = self(xs, segment_sizes)
 
         # Calculate loss (next token prediction)
-        targets = xs[:, 1:].contiguous()  # Shift targets by 1
+        targets = label[:, 1:].contiguous()  # Shift targets by 1
         logits = logits[:, :-1, :].contiguous()  # Remove last logit
 
         query_positions = self.compute_last_segment_positions(segment_sizes)
@@ -844,15 +808,6 @@ class PromoterModel(lightning.LightningModule):
             if param.dim() > 1:
                 torch.nn.init.kaiming_uniform_(param)
 
-    def on_before_optimizer_step(self, optimizer):
-        # Compute the 2-norm for each layer
-        # If using mixed precision, the gradients are already unscaled here
-        # norms = grad_norm(self.model.layer, norm_type=2)
-        # print(norms)
-        pass
-
-    def _clamp(self, x: torch.Tensor, minimum=0.0001) -> torch.Tensor:
-        return x.clamp(min=torch.Tensor([minimum]).to(x.dtype).cuda())
 
     def calculate_individual_losses(
         self, shift_logits, shift_labels, padding_idx=IGNORE_INDEX, query_positions=None
@@ -932,185 +887,6 @@ class PromoterModel(lightning.LightningModule):
         return query_positions
 
 
-def compute_similarity_matrix(strings):
-    """
-    Compute a similarity matrix from dissimilarity scores.
-
-    Args:
-        strings: List of strings
-        dissimilarity_func: Function that takes two strings and returns a dissimilarity score
-
-    Returns:
-        A similarity matrix (kernel matrix)
-    """
-
-    def hamming_distance(seq1, seq2):
-        """
-        Calculate the Hamming distance between two DNA sequences.
-
-        Args:
-            seq1 (str): First DNA sequence
-            seq2 (str): Second DNA sequence
-
-        Returns:
-            int: Hamming distance (number of differing positions)
-
-        Raises:
-            ValueError: If sequences have different lengths
-        """
-        if len(seq1) != len(seq2):
-            raise ValueError(f"{len(seq1)} and {len(seq2)} are not equal length")
-
-        distance = 0
-        for i in range(len(seq1)):
-            if seq1[i] != seq2[i]:
-                distance += 1
-
-        return distance
-
-    n = len(strings)
-    # Initialize similarity matrix
-    L = np.zeros((n, n))
-    # Compute pairwise dissimilarities and convert to similarities
-    for i in range(n):
-        for j in range(n):
-            if i == j:
-                L[i, j] = 1.0  # Self-similarity is 1
-            else:
-                # Convert dissimilarity to similarity (higher dissimilarity = lower similarity)
-                dissimilarity = levenshtein_distance(strings[i], strings[j])
-                # Use RBF kernel to convert dissimilarity to similarity
-                L[i, j] = np.exp(-dissimilarity)
-
-    return L
-
-
-def elementary_symmetric_polynomial(eigenvalues, k):
-    """
-    Compute elementary symmetric polynomials (e_k) using recursion.
-
-    Args:
-        eigenvalues: Array of eigenvalues
-        k: Size of the subset
-
-    Returns:
-        Array of e_0, e_1, ..., e_k
-    """
-    n = len(eigenvalues)
-    E = np.zeros((k + 1, n + 1))
-    E[0, :] = 1
-
-    for l in range(1, k + 1):
-        for n_idx in range(1, n + 1):
-            E[l, n_idx] = E[l, n_idx - 1] + eigenvalues[n_idx - 1] * E[l - 1, n_idx - 1]
-
-    return E[:, n]
-
-
-def sample_kdpp(L, k):
-    """
-    Sample a subset of size k using k-DPP.
-
-    Args:
-        L: Similarity matrix (kernel matrix)
-        k: Size of the subset to sample
-
-    Returns:
-        List of indices representing the sampled subset
-    """
-    n = L.shape[0]
-
-    # Compute eigendecomposition of L
-    eigenvalues, eigenvectors = np.linalg.eigh(L)
-    # Sort eigenvalues in descending order
-    idx = np.argsort(eigenvalues)[::-1]
-    eigenvalues = eigenvalues[idx]
-    eigenvectors = eigenvectors[:, idx]
-
-    # Compute elementary symmetric polynomials
-    E = elementary_symmetric_polynomial(eigenvalues, k)
-
-    # Phase 1: Select k eigenvectors
-    selected_indices = []
-    remaining = list(range(n))
-
-    for i in range(k, 0, -1):
-        # Compute probabilities
-        probs = np.zeros(len(remaining))
-        for j, idx in enumerate(remaining):
-            # print(E.shape, eigenvalues.shape, probs.shape)
-            # breakpoint()
-            probs[j] = eigenvalues[idx] * E[i - 1] / E[i]
-
-        # Normalize probabilities
-        probs = probs / np.sum(probs)
-
-        # Sample index
-        j = np.random.choice(len(remaining), p=probs)
-        selected_indices.append(remaining[j])
-        remaining.pop(j)
-
-    # Phase 2: Convert from eigenvector indices to item indices
-    V = eigenvectors[:, selected_indices]
-
-    # Orthonormalize V
-    Y = np.zeros((n, k))
-    for i in range(k):
-        Y[:, i] = V[:, i]
-        for j in range(i):
-            Y[:, i] = Y[:, i] - np.dot(Y[:, i], Y[:, j]) * Y[:, j]
-        Y[:, i] = Y[:, i] / np.linalg.norm(Y[:, i])
-
-    # Sample items
-    selected_set = set()
-    remaining_items = list(range(n))
-
-    for i in range(k, 0, -1):
-        # Compute probabilities
-        probs = np.zeros(len(remaining_items))
-        for j, idx in enumerate(remaining_items):
-            probs[j] = np.sum(Y[idx, :i] ** 2)
-
-        # Normalize probabilities
-        probs = probs / np.sum(probs)
-
-        # Sample item
-        j = np.random.choice(len(remaining_items), p=probs)
-        selected_set.add(remaining_items[j])
-
-        # Update Y
-        e_j = Y[remaining_items[j], :i] / np.linalg.norm(Y[remaining_items[j], :i])
-        Y_new = np.zeros((n, i - 1))
-
-        for l in range(n):
-            for m in range(i - 1):
-                Y_new[l, m] = Y[l, m] - e_j[m] * Y[l, i - 1]
-
-        Y = Y_new
-        remaining_items.pop(j)
-
-    return list(selected_set)
-
-
-def kdpp_select_diverse_seqs(sequences, k):
-    """
-    Select a diverse subset of sequences using k-DPP.
-
-    Args:
-        strings: List of strings
-        dissimilarity_func: Function that takes two strings and returns a dissimilarity score
-        k: Size of the subset to select
-
-    Returns:
-        List of selected strings
-    """
-    # Compute similarity matrix
-    L = compute_similarity_matrix(sequences)
-    # Sample subset
-    selected_indices = sample_kdpp(L, k)
-    # Return selected strings
-    return [sequences[i] for i in selected_indices]
-
 
 def main():
     parser = argparse.ArgumentParser(description="Train a PromoterModel")
@@ -1121,7 +897,7 @@ def main():
         "--num_epochs", type=int, default=12, help="Number of training epochs"
     )
     parser.add_argument(
-        "--max_len", type=int, default=16000, help="Maximum sequence length"
+        "--max_len", type=int, default=24576, help="Maximum sequence length"
     )
     parser.add_argument(
         "--initial_learning_rate",
@@ -1174,11 +950,11 @@ def main():
     with open("data/query.pkl", "rb") as f:
         q = pickle.load(f)
 
-    '''
+ 
     # some toy data to debug with
-    example, example_query, val_example, val_query = PromoterDataset.train_validation_split( chr= 19, sequences=example, queries=example_query)
-    train_seq, train_query, val_seq, val_query  = PromoterDataset.train_validation_split(19, h, q)
-    '''
+    # example, example_query, val_example, val_query = PromoterDataset.train_validation_split( chr= 19, sequences=example, queries=example_query)
+    # train_seq, train_query, val_seq, val_query  = PromoterDataset.train_validation_split(19, h, q)
+   
 
     train_seq, train_query, val_seq, val_query = (
         PromoterDataset._train_validation_split(19, h, q)
@@ -1190,7 +966,7 @@ def main():
 
     model = PromoterModel()
 
-    model.initialize_model()
+    # model.initialize_model()
 
     logger = WandbLogger(project="poet")
     train_dataset = PromoterDataset(train_seq, train_query, alphabet, args.max_len)
@@ -1212,16 +988,16 @@ def main():
 
     checkpoint_callback = ModelCheckpoint(
         dirpath="model/",
-        filename="greedy_with_qloss_{epoch}-{val_loss:.2f}-{other_metric:.2f}",
+        filename="random_no_dropout_small_{epoch}-{val_loss:.2f}-{other_metric:.2f}",
         save_top_k=-1,
-        every_n_epochs=2,
+        every_n_epochs=1,
     )
 
     trainer = lightning.Trainer(
         max_epochs=args.num_epochs,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         # accelerator="cpu",
-        # devices="auto",
+        devices="auto",
         logger=logger,
         detect_anomaly=True,
         log_every_n_steps=10,
@@ -1229,7 +1005,7 @@ def main():
         # gradient_clip_val=0.5,
         # gradient_clip_algorithm="value"
         strategy="ddp",
-        devices=2,
+        # devices=1,
         val_check_interval=0.25,
         callbacks=[checkpoint_callback],
     )
