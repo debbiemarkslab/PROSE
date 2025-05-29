@@ -3,7 +3,7 @@ import itertools
 import string
 from pathlib import Path
 from typing import Callable, Optional, Sequence, TypeVar, List
-
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -60,14 +60,15 @@ def _get_sample_fast(
     model: PoET,
     batch_size: int,
     alphabet: Uniprot21,
+    temperature: float
 ) -> np.ndarray:
     
     sample_xs, sample_scores = model.min_sample_given_memory(memory = memory, 
-                                                         temperature = 1.5, # try changing it
+                                                         temperature = temperature, # try changing it
                                                          top_k = None,
                                                          top_p = None,
                                                         #  minlen = 500, 
-                                                         maxlen = 1000,
+                                                         maxlen = 1002,
                                                          alphabet = alphabet,
                                                          batch_size = batch_size)
     
@@ -80,6 +81,7 @@ def get_sample_fast(
     model: PoET,
     batch_size: int,
     alphabet: Uniprot21,
+    temperature: float
 ) -> np.ndarray:
     if len(msa_sequences) > 0:
         segment_sizes = torch.tensor([len(s) for s in msa_sequences]).cuda()
@@ -99,6 +101,7 @@ def get_sample_fast(
         model=model,
         batch_size=batch_size,
         alphabet=alphabet,
+        temperature = temperature
     )
 
 
@@ -115,7 +118,7 @@ def parse_args():
 
     parser.add_argument("--batch_size", 
                         type=int, 
-                        default=8)
+                        default=2)
     parser.add_argument("--seed", 
                         type=int, 
                         default=188257)
@@ -123,6 +126,10 @@ def parse_args():
     parser.add_argument("--hits_path",
                         type=str,
                         default="data/hits.pkl"
+    )
+    parser.add_argument("--temp",
+                        type=float,
+                        default=0.5
     )
     
     args = parser.parse_args()
@@ -137,18 +144,26 @@ def main():
         hits = pickle.load(f)
 
     names = [i for i in hits.keys() if i.endswith('_chr19')]
+    # names = random.choices(names, k=3000)
    
     print("-------loading model--------")
 
-    model = PromoterModel()
-    model.load_from_checkpoint(args.ckpt_path)
+    model = PromoterModel.load_from_checkpoint(args.ckpt_path, config = {
+            "n_vocab": 8,
+            "hidden_dim": 768,
+            "num_layers": 6,
+            "nhead": 12,
+            "dropout": 0,
+            "use_multi_rotary": True,
+            "norm": True,
+        })
     model = model.model
     alphabet = ATCG()
     model = model.cuda().eval()
     dataset = PromoterDataset(sequences = hits, 
                               queries = {}, 
                               alphabet = alphabet, 
-                              max_length = 64000)
+                              max_length = 16000)
     
     # get homologs to score
     print("-------generating prompt--------")
@@ -159,7 +174,6 @@ def main():
 
     for id in tqdm(names, total=len(names)):
         curr = np.array(dataset.get_inference_seqs(variant = "", id = id))
-        
         msa_sequences.append(curr)
 
     print("-------generating sequences--------")
@@ -171,7 +185,7 @@ def main():
     with torch.cuda.amp.autocast():
         for prompt, _ in tqdm(zip(msa_sequences, names), total=len(names)):
             prompt = get_encoded_msa_from_a3m_seqs(msa_sequences=prompt, alphabet=alphabet)
-            samples, scores = get_sample_fast(prompt, model, args.batch_size, alphabet)
+            samples, scores = get_sample_fast(prompt, model, args.batch_size, alphabet, args.temp)
             # print(samples)
             all_samples.append(samples)
             all_scores.append(scores)
@@ -182,7 +196,7 @@ def main():
     df['GENE'] = names
     df['samples'] = all_samples
     df['scores'] = all_scores
-    df.to_csv("data/hightemp_reversed_generated_promoters.csv")
+    df.to_csv("data/small_16k_context_greedy_low_temp_generated_promoters.csv")
     print("-------finished-------")
     
 if __name__ == "__main__":

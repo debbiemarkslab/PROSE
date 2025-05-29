@@ -12,7 +12,7 @@ from poet.alphabets import Alphabet
 from poet.models.poet import PoET
 # from bert import DNA
 import random
-
+import itertools
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.utilities.grads import grad_norm
 from lightning.pytorch.callbacks import ModelCheckpoint
@@ -65,14 +65,16 @@ class PromoterDataset(Dataset):
     def __init__(self, sequences: dict, queries: dict, alphabet, max_length):
         self.alphabet = alphabet
         self.sequences = {k: list(v) for k, v in sequences.items()}
+        all_seqs = []
+        for seq in self.sequences.values():
+            all_seqs.extend(seq)
         self.queries = queries
         self.num_special_characters = 2
-        self.ids = list(sequences.keys())
-        self.sampling_weights = [len(v) for k, v in self.sequences.items()]
-        total = sum(self.sampling_weights)
-        self.sampling_weights = [i / total for i in self.sampling_weights]
+        self.ids = list(queries.values())
+        self.ids.extend(all_seqs)
+
         self.max_len = max_length
-        self.iters = len(self.ids) * 5
+        self.iters = len(self.ids) 
 
         self.counter = defaultdict(int)
 
@@ -81,16 +83,17 @@ class PromoterDataset(Dataset):
         randomly sample a gene with replacement
         weighted by the number of sequences the gene has
         """
-        id = np.random.choice(self.ids, 
-                              p=self.sampling_weights
-                              )
-        self.counter[id] += 1
+        query = self.ids[idx]
+        
 
-        sampled_set = self.greedy_sample_and_fit_sequences(
-            query_id_or_sequence=id,
-            max_seq_length=self.max_len,
-            p_human=1
-        )
+        sampled_set = {
+            "id": idx,
+            "sequence": query,
+            "passages": [],
+            "passage_lengths": [],
+            "query_length": len(query) + self.num_special_characters,
+            "total_tokens": len(query) + self.num_special_characters,
+        }
         
         # sampled_set = self.diverse_sample_and_fit_sequences(id, max_seq_length=self.max_len)
         return self.pack_inputs(sampled_set, 
@@ -181,9 +184,7 @@ class PromoterDataset(Dataset):
         else:
             query_sequence = self.sample_query(
                 query_id_or_sequence, 
-                p_human = 0.30
-                
-                 # Prob(human sequence) 
+                p_human = 0.05 # Prob(human sequence) 
             )  
 
         # Apply individual sequence length limit if specified
@@ -274,7 +275,7 @@ class PromoterDataset(Dataset):
         max_individual_seq_length: Optional[int] = None,
         include_query: bool = True,
         sequence : str = None,
-        p_human: float = 0.30
+        p_human: float = 0.15
     ) -> Dict[str, Any]:
         """
         Iteratively samples a subset of a given total size by selecting sequences that
@@ -384,7 +385,7 @@ class PromoterDataset(Dataset):
             sum_distances_to_selected[remaining_available_indices] += distances_to_new
 
         passages = [member_ids[i] for i in selected_indices]
-        # print(passages)
+
         return {
             "id": query_id_or_sequence if include_query else None,
             "sequence": query_sequence,
@@ -653,13 +654,13 @@ class PromoterModel(lightning.LightningModule):
         "hidden_dim": 1024,
         "num_layers": 12,
         "nhead": 16,
-        "dropout": 0.1,
+        "dropout": 0.2,
         "use_multi_rotary": True,
         "norm": True
         }
         if config is None:
-            config = big
-        self.model = PoET(**config).cuda()
+            config = small
+        self.model = PoET(**big).cuda()
         # print(self.model.n_vocab)
 
     def forward(self, xs: torch.Tensor, segment_sizes: torch.Tensor) -> torch.Tensor:
@@ -825,13 +826,13 @@ class PromoterModel(lightning.LightningModule):
 def main():
     parser = argparse.ArgumentParser(description="Train a PromoterModel")
     parser.add_argument(
-        "--batch_size", type=int, default=2, help="Batch size for training"
+        "--batch_size", type=int, default=24, help="Batch size for training"
     )
     parser.add_argument(
         "--num_epochs", type=int, default=12, help="Number of training epochs"
     )
     parser.add_argument(
-        "--max_len", type=int, default=16768, help="Maximum sequence length"
+        "--max_len", type=int, default=1100, help="Maximum sequence length"
     )
     parser.add_argument(
         "--initial_learning_rate",
@@ -858,19 +859,20 @@ def main():
 
     alphabet = ATCG(
         mask=True, include_gap=True, include_startstop=True, distinct_startstop=True
-    )   
-    # CHANGE MODEL SIZE HERE
-    small = {
-            "n_vocab": 8,
-            "hidden_dim": 768,
-            "num_layers": 6,
-            "nhead": 12,
-            "dropout": 0,
-            "use_multi_rotary": True,
-            "norm": True,
-        }
+    )
     
-    model = PromoterModel(small)
+    # alphabet = DNA(mask=True)
+    # cfg = {
+    #         "n_vocab": 4096,
+    #         "hidden_dim": 768,
+    #         "num_layers": 6,
+    #         "nhead": 12,
+    #         "dropout": 0.1,
+    #         "use_multi_rotary": True,
+    #         "norm": True,
+    #     }
+    
+    model = PromoterModel()
 
     logger = WandbLogger(project="poet")
     train_dataset = PromoterDataset(train_seq, train_query, alphabet, args.max_len)
@@ -892,7 +894,7 @@ def main():
 
     checkpoint_callback = ModelCheckpoint(
         dirpath="model/",
-        filename="all_human_16k_reversed_0._human_big_greedy_0.2_dropout_{epoch}",
+        filename="single_0.3_human_big_greedy_0.2_dropout_{epoch}",
         save_top_k=-1,
         every_n_epochs=1,
     )
@@ -905,7 +907,7 @@ def main():
         log_every_n_steps=10,
         precision="bf16",
         strategy="ddp",
-        devices=2,
+        devices=1,
         val_check_interval=0.25,
         callbacks=[checkpoint_callback],
     )
@@ -916,8 +918,7 @@ def main():
         train_dataloaders=train_loader,
         val_dataloaders=val_loader,
     )
-    with open('logs/train_distribution.pkl', 'wb') as file:
-        pickle.dump(train_dataset.counter, file)
+    
 
 if __name__ == "__main__":
     main()

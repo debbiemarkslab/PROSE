@@ -2,7 +2,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:l40s:1
 #SBATCH -p gpu_quad
-#SBATCH -t 1-12:00
+#SBATCH -t 1-00:00
 #SBATCH --mem=50GB
 #SBATCH --output=/n/groups/marks/users/erik/Promoter_Poet_private/slurm/prose%j.out
 #SBATCH --error=/n/groups/marks/users/erik/Promoter_Poet_private/slurm/prose%j.err
@@ -14,3 +14,4 @@ export LD_LIBRARY_PATH=/home/jix836/.conda/envs/promoet/lib:${LD_LIBRARY_PATH}
 cd /n/groups/marks/users/erik/Promoter_Poet_private
 # python scripts/sanity.py
 python scripts/generate.py
+# python scripts/score_promoet.py
