@@ -298,6 +298,8 @@ def main():
             # skip unknown genes
             if not msa.size:
                 logps.append(None)
+                var_scores.append(None)
+                wt_scores.append(None)
                 continue
 
             msa = get_encoded_msa_from_a3m_seqs(msa_sequences=msa, alphabet=alphabet)
@@ -311,21 +313,24 @@ def main():
                 pbar_position=PBAR_POSITION,
             )
         
-            backward_logps = get_logps_tiered_fast(
-                msa_sequences=[np.ascontiguousarray(s[::-1]) for s in msa],
-                variants=[np.ascontiguousarray(var[::-1]), np.ascontiguousarray(w[::-1])],
-                model=model,
-                batch_size=args.batch_size,
-                alphabet=alphabet,
-                pbar_position=PBAR_POSITION,
-            )
+            # backward_logps = get_logps_tiered_fast(
+            #     msa_sequences=[np.ascontiguousarray(s[::-1]) for s in msa],
+            #     variants=[np.ascontiguousarray(var[::-1]), np.ascontiguousarray(w[::-1])],
+            #     model=model,
+            #     batch_size=args.batch_size,
+            #     alphabet=alphabet,
+            #     pbar_position=PBAR_POSITION,
+            # )
 
-            curr_logps = (forward_logps[0] + backward_logps[0] - forward_logps[1] - backward_logps[1]) / 2
+            # curr_logps = (forward_logps[0] + backward_logps[0] - forward_logps[1] - backward_logps[1]) / 2
+            # var_score = (forward_logps[0] + backward_logps[0]) / (2 * len(w) - 4)
+            # wt_score = (forward_logps[1] + backward_logps[1]) / (2 * len(var) - 4)
+            var_score = (forward_logps[0] ) / ( len(w) - 2)
+            wt_score = (forward_logps[1] ) / ( len(var) - 2)
+            var_scores.append(var_score)
+            wt_scores.append(wt_score)
             
-            var_scores.append((forward_logps[0] + backward_logps[0]) / 2)
-            wt_scores.append((forward_logps[1] + backward_logps[1]) / 2)
-            
-            logps.append(curr_logps)
+            logps.append(var_score - wt_score)
 
     print("-------saving output--------")
 

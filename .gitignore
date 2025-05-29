@@ -5,6 +5,7 @@ data/LICENSE
 data/
 wandb/latest-run/
 model/
+sei/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

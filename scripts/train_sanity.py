@@ -10,7 +10,7 @@ from torch_optimizer import Adafactor
 import pickle
 from poet.alphabets import Alphabet
 from poet.models.poet import PoET
-from bert import DNA
+# from bert import DNA
 import random
 
 from lightning.pytorch.loggers.wandb import WandbLogger
@@ -18,9 +18,8 @@ from lightning.pytorch.utilities.grads import grad_norm
 from lightning.pytorch.callbacks import ModelCheckpoint
 from collections import defaultdict
 
-# IGNORE_INDEX = -100
-IGNORE_INDEX = 3
-
+IGNORE_INDEX = -100
+# IGNORE_INDEX = 3
 
 
 class ATCG(Alphabet):
@@ -63,32 +62,24 @@ class PromoterDataset(Dataset):
     Dataloader for promoter sets from Zoonomia
     """
 
-    def __init__(self, sequences: dict, queries: dict, alphabet, max_length):
+    def __init__(self, sequences: list, alphabet, max_length):
         self.alphabet = alphabet
-        self.sequences = {k: list(v) for k, v in sequences.items()}
-        self.queries = queries
-        self.num_special_characters = 2
-        self.ids = list(sequences.keys())
-        self.sampling_weights = [len(v) for k, v in self.sequences.items()]
-        total = sum(self.sampling_weights)
-        self.sampling_weights = [i / total for i in self.sampling_weights]
+        self.sequences = sequences
         self.max_len = max_length
-        self.iters = len(self.ids) * 5
+        self.iters = len(self.sequences) * 5
+        self.num_special_characters = 2
 
-        self.counter = defaultdict(int)
+
 
     def __getitem__(self, idx):
         """
         randomly sample a gene with replacement
         weighted by the number of sequences the gene has
         """
-        id = np.random.choice(self.ids, 
-                              p=self.sampling_weights
-                              )
-        self.counter[id] += 1
-
+       
+        
         sampled_set = self.sample_and_fit_sequences(
-            query_id_or_sequence=id,
+            sequence = random.choice(self.sequences),
             max_seq_length=self.max_len,
         )
         
@@ -106,25 +97,6 @@ class PromoterDataset(Dataset):
         except KeyError:
             return []
         return sampled_set["passages"]
-
-    def sample_query(self, id: str, p_human: float) -> str:
-        """
-        sample a query sequence for a given gene, with a chosen probability of
-        sampling a human sequence
-
-        Args:
-        id: gene name
-        p_human: percent probability of sampling human
-
-        Returns:
-        single sampled DNA sequence as a query
-        """
-        # human = np.random.choice([True, False], p=[p_human, 1 - p_human])
-        if np.random.rand() < p_human:
-            return self.queries[id]
-        else:
-            return np.random.choice(self.sequences[id])
-
 
     def sample_and_fit_sequences(
         self,
@@ -174,7 +146,8 @@ class PromoterDataset(Dataset):
                 query_id_or_sequence, 
                 p_human = 0.05 # Prob(human sequence) 
             )  
-
+        # print(query_sequence)
+        # breakpoint()
         # Apply individual sequence length limit if specified
         if max_individual_seq_length and query_sequence:
             query_sequence = truncate_sequence(
@@ -197,53 +170,39 @@ class PromoterDataset(Dataset):
         total_tokens = query_length if query_length is not None else 0
         leftover = effective_length
 
-        member_ids = self.sequences[query_id_or_sequence]
-
         if sample:
-            member_weights = np.array(
-                weights
-                if weights is not None
-                else [1.0 / len(member_ids)] * len(member_ids)
-            )
-            member_weights /= member_weights.sum()
-
+          
             skip_rounds = 0
             while leftover > 0 and skip_rounds < max_skips:
-                sampled_ids = np.random.choice(
-                    member_ids, size=chunk_size, replace=True, p=member_weights
-                )
-                added = False
 
-                for seq in sampled_ids:
-                    if not seq:
-                        continue
+                seq = query_sequence
 
-                    # Apply individual sequence length limit if specified
-                    if max_individual_seq_length:
-                        seq = truncate_sequence(seq, max_individual_seq_length)
+                # Apply individual sequence length limit if specified
+                if max_individual_seq_length:
+                    seq = truncate_sequence(seq, max_individual_seq_length)
 
-                    seq_len = len(seq) + self.num_special_characters
-                    if seq_len <= leftover:
-                        passages.append(seq)
-                        passage_lengths.append(seq_len)
-                        leftover -= seq_len
-                        total_tokens += seq_len
-                        added = True
-                    elif truncate and leftover > 0:
-                        # Truncate to fit remaining space
-                        trunc_len = leftover - self.num_special_characters
-                        seq = seq[:trunc_len]
-                        passages.append(seq)
-                        passage_lengths.append(leftover)
-                        total_tokens += leftover
-                        leftover = 0
-                        added = True
-                        break
+                seq_len = len(seq) + self.num_special_characters
+                if seq_len <= leftover:
+                    passages.append(seq)
+                    passage_lengths.append(seq_len)
+                    leftover -= seq_len
+                    total_tokens += seq_len
+                    added = True
+                elif truncate and leftover > 0:
+                    # Truncate to fit remaining space
+                    trunc_len = leftover - self.num_special_characters
+                    seq = seq[:trunc_len]
+                    passages.append(seq)
+                    passage_lengths.append(leftover)
+                    total_tokens += leftover
+                    leftover = 0
+                    added = True
+                    break
 
-                    if leftover <= 0:
-                        break
+                if leftover <= 0:
+                    break
 
-                skip_rounds = 0 if added else skip_rounds + 1
+            skip_rounds = 0 if added else skip_rounds + 1
 
         return {
             "id": query_id_or_sequence if include_query else None,
@@ -254,135 +213,6 @@ class PromoterDataset(Dataset):
             "total_tokens": total_tokens,
         }
     
-    def greedy_sample_and_fit_sequences(
-        self,
-        query_id_or_sequence: Optional[
-            str
-        ] = None,  # Changed parameter name to be more explicit
-        max_seq_length: int = 12048,
-        max_individual_seq_length: Optional[int] = None,
-        include_query: bool = True,
-        sequence : str = None,
-        p_human: float = 0.3
-    ) -> Dict[str, Any]:
-        """
-        Iteratively samples a subset of a given total size by selecting sequences that
-        maximize the average Hamming distance to the already selected sequences.
-
-        Args:
-            query_id_or_sequence: Either a UniRef ID to lookup in fasta_dataset, or the actual sequence
-            max_seq_length: Maximum length of all sequences combined
-            max_individual_seq_length: Optional int to limit the length of individual sequences.
-            sequence: Optional provided query sequence 
-            p_human: Optional probability of sampling a human query, if not given
-        Returns:
-            Dict with id, sequence, passages, passage_lengths, query_length, and total_tokens
-        """
-
-        def truncate_sequence(seq: str, max_len: int) -> str:
-            """Helper to truncate a sequence to max length while accounting for special tokens"""
-            if len(seq) + self.num_special_characters > max_len:
-                return seq[: max_len - self.num_special_characters]
-            return seq
-        
-        if sequence is not None:
-            query_sequence = sequence
-        else:
-            query_sequence = self.sample_query(
-                query_id_or_sequence, p_human)  # P(human sequence) = 0.3
-
-        # Apply individual sequence length limit if specified
-        if max_individual_seq_length and query_sequence:
-            query_sequence = truncate_sequence(
-                query_sequence, max_individual_seq_length)
-
-        query_length = (len(query_sequence) + self.num_special_characters if query_sequence else None)
-
-        # Calculate effective length for passages
-        effective_length = max_seq_length - (
-            query_length if query_length is not None else 0)
-
-        passages = []
-        passage_lengths = []
-        total_tokens = query_length if query_length is not None else 0
-        leftover = effective_length  # TOTAL Lengths of the homologs
-
-        member_ids = self.sequences[query_id_or_sequence]
-        n = len(member_ids)
-        m = max(len(s) for s in member_ids)
-
-        data = np.zeros((len(member_ids), m), dtype=np.uint32) # padded sequence ordinals
-        for i, s in enumerate(member_ids):
-            data[i, :len(s)] = [ord(c) for c in s]
-        
-        selected_indices = []
-        available_mask = np.ones(n, dtype=bool)
-
-        # Stores the *sum* of Hamming distances from each string to the selected set
-        sum_distances_to_selected = np.zeros(n, dtype=np.float64)
-
-        # Start with a random sequence
-        start_index = random.randint(0, n - 1)
-        seq_len = (len(member_ids[start_index]) + self.num_special_characters)
-        leftover -= seq_len
-        total_tokens += seq_len
-        passage_lengths.append(seq_len)
-        selected_indices.append(start_index)
-        available_mask[start_index] = False
-        num_selected = 1
-
-        # Calculate initial distances from the first selected string to all others
-        first_selected_data = data[start_index]
-        # Get indices that are still available
-        current_available_indices = np.where(available_mask)[0]
-        if len(current_available_indices) > 0:
-            
-            # Calculate distances from available strings to the first selected one with broadcasting
-            initial_distances = np.sum(data[current_available_indices] != first_selected_data, axis=1)
-            # Update 
-            sum_distances_to_selected[current_available_indices] = initial_distances
-        
-        # iterative greedy sampling
-        while leftover > 0: 
-            if not np.any(available_mask):
-                break
-            current_available_indices = np.where(available_mask)[0]
-
-            # Calculate the *average* Hamming distance for each available candidate
-            avg_distances_candidates = sum_distances_to_selected[current_available_indices] / num_selected
-            best_candidate_local_idx = np.argmax(avg_distances_candidates)
-            best_original_idx = current_available_indices[best_candidate_local_idx]
-
-            # Add the best candidate to the selected set
-            selected_indices.append(best_original_idx)
-            available_mask[best_original_idx] = False
-
-            num_selected += 1
-            seq_len = (self.num_special_characters + len(member_ids[best_original_idx]))
-            leftover -= seq_len
-            total_tokens += seq_len
-            passage_lengths.append(seq_len)
-            # Update the sum_distances for the remaining available strings
-            newly_selected_data = data[best_original_idx]
-            remaining_available_indices = np.where(available_mask)[0] # Indices still available *after* selecting the latest
-
-            if len(remaining_available_indices) == 0:
-                break
-            # Calculate distances of the newly selected one
-            distances_to_new = np.sum(data[remaining_available_indices] != newly_selected_data, axis=1)
-            sum_distances_to_selected[remaining_available_indices] += distances_to_new
-
-        passages = [member_ids[i] for i in selected_indices]
-
-        return {
-            "id": query_id_or_sequence if include_query else None,
-            "sequence": query_sequence,
-            "passages": passages,
-            "passage_lengths": passage_lengths,
-            "query_length": query_length,
-            "total_tokens": total_tokens,
-        }
-
     def pack_inputs(
         self,
         sample,
@@ -439,34 +269,34 @@ class PromoterDataset(Dataset):
             
             if reverse_sequence:
                 text = text[::-1]
-            # if isinstance(text, str):
-            #     text_bytes = text.encode("ascii")
-            # else:
-            text_bytes = text  # Already bytes
+            if isinstance(text, str):
+                text_bytes = text.encode("ascii")
+            else:
+                text_bytes = text  # Already bytes
             tokens = tokenizer.encode(text_bytes)
             if tokens.ndim == 0:
                 tokens = tokens.unsqueeze(0)
             if reverse_sequence:
-                return torch.cat(
-                    [torch.Tensor([tokenizer.stop_token]), tokens, torch.Tensor([tokenizer.start_token])]
-                )
-                # return np.concatenate(
-                #     [[tokenizer.stop_token], tokens, [tokenizer.start_token]]
+                # return torch.cat(
+                #     [torch.Tensor([tokenizer.stop_token]), tokens, torch.Tensor([tokenizer.start_token])]
                 # )
+                return np.concatenate(
+                    [[tokenizer.stop_token], tokens, [tokenizer.start_token]]
+                )
             else:
-                return torch.cat(
-                    [torch.Tensor([tokenizer.start_token]), tokens, torch.tensor([tokenizer.stop_token])]
-                )
-                # return np.concatenate(
-                #     [[tokenizer.start_token], tokens, [tokenizer.stop_token]]
+                # return torch.cat(
+                #     [torch.Tensor([tokenizer.start_token]), tokens, torch.tensor([tokenizer.stop_token])]
                 # )
+                return np.concatenate(
+                    [[tokenizer.start_token], tokens, [tokenizer.stop_token]]
+                )
 
         # Initialize sequences and lengths
         all_sequences = []
         all_lengths = []
-        # all_lengths = sample[
-        #     "passage_lengths"
-        # ].copy()  # Use pre-calculated passage lengths
+        all_lengths = sample[
+            "passage_lengths"
+        ].copy()  # Use pre-calculated passage lengths
 
         # Process passages
         if sample["passages"]:
@@ -474,7 +304,7 @@ class PromoterDataset(Dataset):
                 if seq is not None:
                     tokens = tokenize_sequence(seq, reverse_sequence)
                     all_sequences.append(tokens)
-                    all_lengths.append(len(tokens))
+                    # all_lengths.append(len(tokens))
 
         # Process query if it exists
         query_sequence = sample["sequence"]
@@ -482,16 +312,16 @@ class PromoterDataset(Dataset):
             tokens = tokenize_sequence(query_sequence, reverse_sequence)
             all_sequences.append(tokens)
             # Use pre-calculated query length
-            # all_lengths.append(sample["query_length"])
-            all_lengths.append(len(tokens))
+            all_lengths.append(sample["query_length"])
+            # all_lengths.append(len(tokens))
 
 
         # Concatenate all sequences
         if all_sequences:
-            tokens = torch.cat(all_sequences).long()
-            # tokens = torch.from_numpy(tokens).long()
-            # tokens = np.concatenate(all_sequences)
-            # tokens = torch.from_numpy(tokens).long()
+            # tokens = torch.cat(all_sequences).long()
+            tokens = torch.from_numpy(tokens).long()
+            tokens = np.concatenate(all_sequences)
+            tokens = torch.from_numpy(tokens).long()
         else:
             tokens = torch.empty(0, dtype=torch.long)
 
@@ -836,26 +666,26 @@ def main():
     )
     args = parser.parse_args()
 
-    with open("data/hits.pkl", "rb") as f:
-        h = pickle.load(f)
-    with open("data/query.pkl", "rb") as f:
-        q = pickle.load(f)   
+    # with open("data/hits.pkl", "rb") as f:
+    #     h = pickle.load(f)
+    # with open("data/query.pkl", "rb") as f:
+    #     q = pickle.load(f)   
 
-    train_seq, train_query, val_seq, val_query = (
-        PromoterDataset._train_validation_split(19, h, q)
-    )
-
-    # alphabet = ATCG(
-    #     mask=True, include_gap=True, include_startstop=True, distinct_startstop=True
+    # train_seq, train_query, val_seq, val_query = (
+    #     PromoterDataset._train_validation_split(19, h, q)
     # )
+
+    alphabet = ATCG(
+        mask=True, include_gap=True, include_startstop=True, distinct_startstop=True
+    )
     
-    alphabet = DNA(mask=True)
+    # alphabet = DNA(mask=True)
     cfg = {
-            "n_vocab": 4096,
+            "n_vocab": 8,
             "hidden_dim": 768,
             "num_layers": 6,
             "nhead": 12,
-            "dropout": 0.1,
+            "dropout": 0,
             "use_multi_rotary": True,
             "norm": True,
         }
@@ -863,8 +693,35 @@ def main():
     model = PromoterModel(cfg)
 
     logger = WandbLogger(project="poet")
-    train_dataset = PromoterDataset(train_seq, train_query, alphabet, args.max_len)
-    val_dataset = PromoterDataset(val_seq, val_query, alphabet, args.max_len)
+
+    def generate_dna_sequence(length):
+        """
+        Generate a random DNA sequence of the specified length.
+        
+        Parameters:
+        length (int): The desired length of the DNA sequence
+        
+        Returns:
+        str: A random DNA sequence consisting of A, T, G, and C
+        """
+        if not isinstance(length, int) or length <= 0:
+            raise ValueError("Length must be a positive integer")
+        
+        # DNA nucleotide bases
+        bases = ['A', 'T', 'G', 'C']
+        
+        # Generate random sequence
+        dna_sequence = ''.join(random.choice(bases) for _ in range(length))
+        
+        return dna_sequence
+
+
+    seqs = [generate_dna_sequence(1000) for i in range(2000)]
+    with open("data/random.pkl", "wb") as fp:   
+        pickle.dump(seqs, fp)
+
+    train_dataset = PromoterDataset(seqs, alphabet, args.max_len)
+    # val_dataset = PromoterDataset(val_seq, val_query, alphabet, args.max_len)
 
     train_loader = DataLoader(
         train_dataset,
@@ -873,16 +730,16 @@ def main():
         collate_fn=train_dataset.padded_collate_packed,
     )
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=val_dataset.padded_collate_packed,
-    )
+    # val_loader = DataLoader(
+    #     val_dataset,
+    #     batch_size=args.batch_size,
+    #     shuffle=False,
+    #     collate_fn=val_dataset.padded_collate_packed,
+    # )
 
     checkpoint_callback = ModelCheckpoint(
         dirpath="model/",
-        filename="bert_0.1_human_big_random_0.1_dropout_small_{epoch}",
+        filename="sanity_0.1_human_small_random_0.1_dropout_small_{epoch}",
         save_top_k=-1,
         every_n_epochs=1,
     )
@@ -896,7 +753,7 @@ def main():
         precision="bf16",
         strategy="ddp",
         devices=2,
-        val_check_interval=0.25,
+        # val_check_interval=0.25,
         callbacks=[checkpoint_callback],
     )
  
@@ -904,10 +761,10 @@ def main():
     trainer.fit(
         model,
         train_dataloaders=train_loader,
-        val_dataloaders=val_loader,
+        # val_dataloaders=val_loader,
     )
-    with open('logs/bert_train_distribution.pkl', 'wb') as file:
-        pickle.dump(train_dataset.counter, file)
+    # with open('logs/bert_train_distribution.pkl', 'wb') as file:
+    #     pickle.dump(train_dataset.counter, file)
 
 if __name__ == "__main__":
     main()

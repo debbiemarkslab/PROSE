@@ -257,16 +257,16 @@ def main():
     msa = get_encoded_msa_from_a3m_seqs(msa_sequences=msa_sequences, alphabet=alphabet)
 
     # score the variants
-    logps = []
-    if not args.debug:
-        params = list(
-            itertools.product(
-                [6144, 12288, 24576],
-                [1.0, 0.95, 0.90, 0.70, 0.50],
-            )
-        )
-    else:
-        params = [(12288, 0.95)]
+    # logps = []
+    # if not args.debug:
+    #     params = list(
+    #         itertools.product(
+    #             [6144, 12288, 24576],
+    #             [1.0, 0.95, 0.90, 0.70, 0.50],
+    #         )
+    #     )
+    # else:
+    params = [(12288, 0.95)]
     for max_tokens, max_similarity in tqdm(params, desc="ensemble"):
         sampler = MSASampler(
             method=NeighborsSampler(
@@ -290,29 +290,17 @@ def main():
             shuffle_seed=args.seed,
             truncate=False,
         )
-        forward_logps = get_logps_tiered_fast(
-            msa_sequences=this_msa_sequences,
-            variants=variants,
-            model=model,
-            batch_size=args.batch_size,
-            alphabet=alphabet,
-            pbar_position=PBAR_POSITION,
-        )
-        # breakpoint()
-        # print(len(forward_logps))
-        # print(variants[0].shape)
-        backward_logps = get_logps_tiered_fast(
-            msa_sequences=[np.ascontiguousarray(s[::-1]) for s in this_msa_sequences],
-            variants=[np.ascontiguousarray(s[::-1]) for s in variants],
-            model=model,
-            batch_size=args.batch_size,
-            alphabet=alphabet,
-            pbar_position=PBAR_POSITION,
-        )
-        this_logps = (forward_logps + backward_logps) / 2
-        logps.append(this_logps)
-    logps = np.vstack(logps).mean(axis=0)
-    np.save(args.output_npy_path, logps)
+
+        segment_sizes = torch.tensor([len(s) for s in this_msa_sequences]).cuda()
+        msa_sequences: torch.Tensor = torch.cat(
+            [torch.from_numpy(s).long() for s in this_msa_sequences]
+        ).cuda()
+        samples, score = model.sample(msa_sequences.unsqueeze(0), segment_sizes.unsqueeze(0))
+        print(samples[0])
+
+
+    # logps = np.vstack(logps).mean(axis=0)
+    # np.save(args.output_npy_path, logps)
 
 
 if __name__ == "__main__":

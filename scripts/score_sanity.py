@@ -1,6 +1,8 @@
 import pickle
 import pandas as pd
 import random 
+import matplotlib.pyplot as plt
+
 def create_sanity_check():
 
     human_path = '/n/groups/marks/users/erik/Promoter_Poet_private/data/query.pkl'
@@ -38,8 +40,8 @@ def create_sanity_check():
     df['WT'] = list(human_seq.values())
     df['GC'] = df['WT'].map(lambda x: ''.join(char for char in x if char not in "GCgc"))
     df['RANDOM'] = df['WT'].map(mutate_dna)
-    df = df[df['GENE'].str.endswith('_chr19')]
-
+    # df = df[df['GENE'].str.endswith('_chr19')]
+    df = df.head(1000)
     df.to_csv('data/sanity_check.csv')
 
 
@@ -91,9 +93,7 @@ def get_encoded_msa_from_a3m_seqs(
     msa_sequences: list[bytes], alphabet: Uniprot21
 ) -> List:
     return [
-            append_startstop(alphabet.encode(s.encode('utf-8')
-                                             .translate(None, delete=ASCII_LOWERCASE_BYTES)), 
-                                             alphabet)
+            append_startstop(alphabet.encode(s.encode("ascii")), alphabet)
             for s in msa_sequences
         ]
 
@@ -142,6 +142,7 @@ def _get_logps_tiered_fast(
         this_variants = this_variants.cuda()
         logits = model.logits(this_variants[:, :-1], memory, preallocated_memory=True)
         targets = this_variants[:, 1:]
+        
         score = -criteria.forward(logits.transpose(1, 2), targets).float().sum(dim=1)
         logps.append(score.cpu().numpy())
         
@@ -184,7 +185,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt_path", 
                         type=str, 
-                        default="/n/groups/marks/users/erik/Promoter_Poet_private/model/random_no_dropout_small_epoch=10-val_loss=0.00-other_metric=0.00.ckpt")
+                        default="/n/groups/marks/users/erik/Promoter_Poet_private/model/1e-3_lr_reversed_random_no_dropout_small_epoch=11-val_loss=0.00-other_metric=0.00.ckpt")
     parser.add_argument("--output_csv_path",
                         type=str,
                         default="data/val_scored_sanity_check.csv",)
@@ -204,12 +205,7 @@ def parse_args():
 
 
 @torch.inference_mode()
-def main():
-    args = parse_args()
-    print("-------loading data--------")
-
-    create_sanity_check()
-    # variants_df = pd.read_csv(args.variants_path)
+def main(context_length):
     variants_df = pd.read_csv('data/sanity_check.csv')
 
     wt = variants_df["WT"].to_numpy()
@@ -217,22 +213,11 @@ def main():
     names = variants_df["GENE"].to_numpy()
     random_var = variants_df["RANDOM"].to_numpy()
 
-    with open(args.hits_path, "rb") as f:
-        hits = pickle.load(f)
-
-    print("-------loading model--------")
-
-    model = PromoterModel()
-    model.load_from_checkpoint(args.ckpt_path)
-    model = model.model
-    alphabet = ATCG()
-    model = model.cuda().eval()
     dataset = PromoterDataset(sequences = hits, 
                               queries = {}, 
                               alphabet = alphabet, 
-                              max_length = 24576)
+                              max_length = context_length)
 
-    
     # get homologs to score
     print("-------generating prompt--------")
 
@@ -246,15 +231,15 @@ def main():
         msa_sequences.append(curr)
     
     gc_var = [
-        append_startstop(alphabet.encode(v.encode('utf-8')), alphabet=alphabet)
+        append_startstop(alphabet.encode(v.encode("ascii")), alphabet=alphabet)
         for v in gc_var
     ]
     random_var = [
-        append_startstop(alphabet.encode(v.encode('utf-8')), alphabet=alphabet)
+        append_startstop(alphabet.encode(v.encode("ascii")), alphabet=alphabet)
         for v in random_var
     ]
     wt =  [
-        append_startstop(alphabet.encode(v.encode('utf-8')), alphabet=alphabet)
+        append_startstop(alphabet.encode(v.encode("ascii")), alphabet=alphabet)
         for v in wt
     ]
 
@@ -266,15 +251,16 @@ def main():
     print("-------scoring variants--------")
 
     torch.cuda.empty_cache()
-    with torch.cuda.amp.autocast():
+    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
         for i, (w ,gc, random) in tqdm(enumerate(zip(wt, gc_var, random_var)), total=len(wt)):
         
             msa = msa_sequences[i]
+            # msa = []
             msa = get_encoded_msa_from_a3m_seqs(msa_sequences=msa, alphabet=alphabet)
 
             forward_logps = get_logps_tiered_fast(
                 msa_sequences=msa,
-                variants=[np.array(gc), np.array(random),np.array(w)],
+                variants=[np.array(gc), np.array(random), np.array(w)],
                 model=model,
                 batch_size=args.batch_size,
                 alphabet=alphabet,
@@ -292,26 +278,86 @@ def main():
 
             # curr_logps = (forward_logps[0] + backward_logps[0] - forward_logps[1] - backward_logps[1]) / 2
             
-            gc_scores.append((forward_logps[0] + backward_logps[0]) / 2)
-            random_scores.append((forward_logps[1] + backward_logps[1]) / 2)
-            wt_scores.append((forward_logps[2] + backward_logps[2] )/ 2)
-            
+            gc_scores.append((forward_logps[0] + backward_logps[0]) / (2 * (len(gc) - 2)))  # -2 for start/stop tokens))
+            random_scores.append((forward_logps[1] + backward_logps[1]) / (2 * (len(random) - 2)))  # -2 for start/stop tokens)
+            wt_scores.append((forward_logps[2] + backward_logps[2] )/ (2 * (len(w) - 2)))  # -2 for start/stop tokens)
+            # gc_scores.append((forward_logps[0] ) / ((len(gc) - 2)))  # -2 for start/stop tokens))
+            # random_scores.append((forward_logps[1] ) / ((len(random) - 2)))  # -2 for start/stop tokens)
+            # wt_scores.append((forward_logps[2] )/ ((len(w) - 2)))  # -2 for start/stop tokens)
             # logps.append(curr_logps)
 
     print("-------saving output--------")
 
     # np.save(args.output_npy_path, logps)
-    variants_df['GC_scores'] = gc_scores
-    variants_df['random_scores'] = random_scores
-    variants_df['WT_scores'] = wt_scores
+    # variants_df['GC_scores'] = gc_scores
+    # variants_df['random_scores'] = random_scores
+    # variants_df['WT_scores'] = wt_scores
 
-    variants_df.to_csv(args.output_csv_path)
+    gc_scores = np.array(gc_scores)
+    random_scores = np.array(random_scores)
+    wt_scores = np.array(wt_scores)
+    # variants_df.to_csv(args.output_csv_path)
     
     print("-------result-------")
-    print(f'WT average: {variants_df["WT_scores"].mean()}')
-    print(f'GC average: {variants_df["GC_scores"].mean()}')
-    print(f'Random average: {variants_df["random_scores"].mean()}')
+    print(f'WT average: {wt_scores.mean()}')
+    print(f'GC average: {gc_scores.mean()}')
+    print(f'Random average: {random_scores.mean()}')
     print("-------finished-------")
+
+    return wt_scores.mean(), gc_scores.mean(), random_scores.mean()
     
 if __name__ == "__main__":
-    main()
+    # main()
+
+    create_sanity_check()
+    args = parse_args()
+    print("-------loading data--------")
+
+    # variants_df = pd.read_csv(args.variants_path
+
+    with open(args.hits_path, "rb") as f:
+        hits = pickle.load(f)
+
+    print("-------loading model--------")
+
+    model = PromoterModel.load_from_checkpoint(args.ckpt_path)
+    model = model.model
+    alphabet = ATCG()
+    model = model.cuda().eval()
+
+    ctx_length = 2 ** np.arange(19)
+    
+    all_wt = []
+    all_gc = []
+    all_rand = []
+
+    # for ctx in ctx_length:
+    for ctx in [32800]:
+
+        wts, gcs, rands = main(ctx)
+        all_wt.append(wts)
+        all_gc.append(gcs)
+        all_rand.append(rands)
+        
+    breakpoint()
+    plt.figure(figsize=(10, 6))
+    
+    plt.plot(ctx_length, all_wt, 'o-', label='WT')
+    plt.plot(ctx_length, all_gc, 's-', label='GC')
+    plt.plot(ctx_length, all_rand, '^-', label='Random')
+    
+    plt.xscale('log', base=2)  # Use log scale with base 2 for x-axis
+    plt.xlabel('Context Length (Powers of 2)')
+    plt.ylabel('Value')
+    plt.title('Performance vs Context Length')
+    plt.grid(True, which="both", ls="-", alpha=0.2)
+    plt.legend()
+    
+    # Add x-ticks at powers of 2
+    plt.xticks(ctx_length, [str(int(x)) for x in ctx_length], rotation=45)
+    plt.tight_layout()
+    plt.show()
+    plt.savefig("context_lengths.png", dpi=1200)
+
+
+
