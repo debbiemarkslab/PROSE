@@ -202,7 +202,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt_path", 
                         type=str, 
-                        default="/n/groups/marks/users/erik/Promoter_Poet_private/model/no_dropout_small_epoch=3-val_loss=0.00-other_metric=0.00.ckpt")
+                        default="/n/groups/marks/users/erik/Promoter_Poet_private/model/8k_reversed_0._human_big_greedy_0.2_dropout_epoch=2.ckpt")
 
     parser.add_argument("--variants_path",
                         type=str,
@@ -250,15 +250,14 @@ def main():
 
     print("-------loading model--------")
 
-    model = PromoterModel()
-    model.load_from_checkpoint(args.ckpt_path)
+    model = PromoterModel.load_from_checkpoint(args.ckpt_path)
     model = model.model
     alphabet = ATCG()
     model = model.cuda().eval()
     dataset = PromoterDataset(sequences = hits, 
                               queries = {}, 
                               alphabet = alphabet, 
-                              max_length = 24576)
+                              max_length = 32576)
 
     
     # get homologs to score
@@ -313,20 +312,20 @@ def main():
                 pbar_position=PBAR_POSITION,
             )
         
-            # backward_logps = get_logps_tiered_fast(
-            #     msa_sequences=[np.ascontiguousarray(s[::-1]) for s in msa],
-            #     variants=[np.ascontiguousarray(var[::-1]), np.ascontiguousarray(w[::-1])],
-            #     model=model,
-            #     batch_size=args.batch_size,
-            #     alphabet=alphabet,
-            #     pbar_position=PBAR_POSITION,
-            # )
+            backward_logps = get_logps_tiered_fast(
+                msa_sequences=[np.ascontiguousarray(s[::-1]) for s in msa],
+                variants=[np.ascontiguousarray(var[::-1]), np.ascontiguousarray(w[::-1])],
+                model=model,
+                batch_size=args.batch_size,
+                alphabet=alphabet,
+                pbar_position=PBAR_POSITION,
+            )
 
             # curr_logps = (forward_logps[0] + backward_logps[0] - forward_logps[1] - backward_logps[1]) / 2
-            # var_score = (forward_logps[0] + backward_logps[0]) / (2 * len(w) - 4)
-            # wt_score = (forward_logps[1] + backward_logps[1]) / (2 * len(var) - 4)
-            var_score = (forward_logps[0] ) / ( len(w) - 2)
-            wt_score = (forward_logps[1] ) / ( len(var) - 2)
+            var_score = (forward_logps[0] + backward_logps[0])  / (2 * len(w) - 4)
+            wt_score = (forward_logps[1] + backward_logps[1]) / (2 * len(var) - 4)
+            # var_score = (forward_logps[0] ) / ( len(w) - 2)
+            # wt_score = (forward_logps[1] ) / ( len(var) - 2)
             var_scores.append(var_score)
             wt_scores.append(wt_score)
             

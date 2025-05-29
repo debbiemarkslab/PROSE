@@ -29,8 +29,8 @@ class ATCG(Alphabet):
 
     def __init__(
         self,
-        mask=True,
-        include_gap=True,
+        mask=False,
+        include_gap=False,
         include_startstop=True,
         distinct_startstop=True,
     ):
@@ -45,6 +45,8 @@ class ATCG(Alphabet):
         if distinct_startstop:
             chars = chars + b"$"
             stop_token = len(chars) - 1
+        chars = chars + b"?" # human token
+        self.human_token = len(chars) - 1
         mask_token = len(chars)
         encoding = np.arange(len(chars))
         missing = mask_token
@@ -55,6 +57,7 @@ class ATCG(Alphabet):
         self.start_token = start_token
         self.stop_token = stop_token
         self.mask_token = mask_token
+        
 
 
 class PromoterDataset(Dataset):
@@ -89,7 +92,7 @@ class PromoterDataset(Dataset):
         sampled_set = self.greedy_sample_and_fit_sequences(
             query_id_or_sequence=id,
             max_seq_length=self.max_len,
-            p_human=1
+            p_human=0.6
         )
         
         # sampled_set = self.diverse_sample_and_fit_sequences(id, max_seq_length=self.max_len)
@@ -130,7 +133,7 @@ class PromoterDataset(Dataset):
         """
         # human = np.random.choice([True, False], p=[p_human, 1 - p_human])
         if np.random.rand() < p_human:
-            return self.queries[id]
+            return "?" + self.queries[id] # human token
         else:
             return np.random.choice(self.sequences[id])
 
@@ -181,9 +184,7 @@ class PromoterDataset(Dataset):
         else:
             query_sequence = self.sample_query(
                 query_id_or_sequence, 
-                p_human = 0.30
-                
-                 # Prob(human sequence) 
+                p_human = 0.05 # Prob(human sequence) 
             )  
 
         # Apply individual sequence length limit if specified
@@ -274,7 +275,7 @@ class PromoterDataset(Dataset):
         max_individual_seq_length: Optional[int] = None,
         include_query: bool = True,
         sequence : str = None,
-        p_human: float = 0.30
+        p_human: float = 0.15
     ) -> Dict[str, Any]:
         """
         Iteratively samples a subset of a given total size by selecting sequences that
@@ -308,7 +309,7 @@ class PromoterDataset(Dataset):
                 query_sequence, max_individual_seq_length)
 
         query_length = (len(query_sequence) + self.num_special_characters if query_sequence else None)
-
+        # print(query_sequence)
         # Calculate effective length for passages
         effective_length = max_seq_length - (
             query_length if query_length is not None else 0)
@@ -639,7 +640,7 @@ class PromoterModel(lightning.LightningModule):
         super().__init__()
         # ckpt = torch.load(ckpt_path)
         small = {
-            "n_vocab": 8,
+            "n_vocab": 9,
             "hidden_dim": 768,
             "num_layers": 6,
             "nhead": 12,
@@ -653,7 +654,7 @@ class PromoterModel(lightning.LightningModule):
         "hidden_dim": 1024,
         "num_layers": 12,
         "nhead": 16,
-        "dropout": 0.1,
+        "dropout": 0.2,
         "use_multi_rotary": True,
         "norm": True
         }
@@ -858,19 +859,20 @@ def main():
 
     alphabet = ATCG(
         mask=True, include_gap=True, include_startstop=True, distinct_startstop=True
-    )   
-    # CHANGE MODEL SIZE HERE
-    small = {
-            "n_vocab": 8,
-            "hidden_dim": 768,
-            "num_layers": 6,
-            "nhead": 12,
-            "dropout": 0,
-            "use_multi_rotary": True,
-            "norm": True,
-        }
+    )
     
-    model = PromoterModel(small)
+    # alphabet = DNA(mask=True)
+    # cfg = {
+    #         "n_vocab": 4096,
+    #         "hidden_dim": 768,
+    #         "num_layers": 6,
+    #         "nhead": 12,
+    #         "dropout": 0.1,
+    #         "use_multi_rotary": True,
+    #         "norm": True,
+    #     }
+    
+    model = PromoterModel()
 
     logger = WandbLogger(project="poet")
     train_dataset = PromoterDataset(train_seq, train_query, alphabet, args.max_len)
@@ -892,7 +894,7 @@ def main():
 
     checkpoint_callback = ModelCheckpoint(
         dirpath="model/",
-        filename="all_human_16k_reversed_0._human_big_greedy_0.2_dropout_{epoch}",
+        filename="token_0.6_human_16k_reversed_big_greedy_0.2_dropout_{epoch}",
         save_top_k=-1,
         every_n_epochs=1,
     )
@@ -905,7 +907,7 @@ def main():
         log_every_n_steps=10,
         precision="bf16",
         strategy="ddp",
-        devices=2,
+        devices=1,
         val_check_interval=0.25,
         callbacks=[checkpoint_callback],
     )
